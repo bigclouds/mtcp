@@ -3,9 +3,16 @@
 #include "tcp_out.h"
 #include "stat.h"
 #include "debug.h"
+#if USE_CCP
+#include "ccp.h"
+#endif
 
+#ifndef MAX
 #define MAX(a, b) ((a)>(b)?(a):(b))
+#endif
+#ifndef MIN
 #define MIN(a, b) ((a)<(b)?(a):(b))
+#endif
 
 /*----------------------------------------------------------------------------*/
 struct rto_hashstore*
@@ -182,6 +189,14 @@ HandleRTO(mtcp_manager_t mtcp, uint32_t cur_ts, tcp_stream *cur_stream)
 			cur_stream->sndvar->snd_una, cur_stream->snd_nxt);
 	assert(cur_stream->sndvar->rto > 0);
 
+	/* if the stream is ready to be closed, don't handle RTO */
+	if (cur_stream->close_reason != TCP_NOT_CLOSED)
+		return 0;
+	
+#if USE_CCP
+	ccp_record_event(mtcp, cur_stream, EVENT_TIMEOUT, 0);
+#endif
+
 	/* count number of retransmissions */
 	if (cur_stream->sndvar->nrtx < TCP_MAX_RTX) {
 		cur_stream->sndvar->nrtx++;
@@ -301,7 +316,13 @@ HandleRTO(mtcp_manager_t mtcp, uint32_t cur_ts, tcp_stream *cur_stream)
 		assert(0);
 		return ERROR;
 	}
-	
+
+	if (cur_stream->have_reset &&
+	    cur_stream->state == TCP_ST_SYN_RCVD) {
+		DestroyTCPStream(mtcp, cur_stream);
+		return 0;
+	}
+
 	cur_stream->snd_nxt = cur_stream->sndvar->snd_una;
 	if (cur_stream->state == TCP_ST_ESTABLISHED || 
 			cur_stream->state == TCP_ST_CLOSE_WAIT) {

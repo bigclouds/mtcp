@@ -12,7 +12,14 @@
 #define MAX_RB_SIZE (16*1024*1024)
 #define MAX(a, b) ((a)>(b)?(a):(b))
 #define MIN(a, b) ((a)<(b)?(a):(b))
-
+#ifdef ENABLELRO
+#define __MEMCPY_DATA_2_BUFFER						\
+	mtcp_manager_t mtcp = rbm->mtcp;				\
+	if (mtcp->iom == &dpdk_module_func && len > TCP_DEFAULT_MSS)	\
+		mtcp->iom->dev_ioctl(mtcp->ctx, 0, PKT_RX_TCP_LROSEG, buff->head + putx); \
+	else								\
+		memcpy(buff->head + putx, data, len);
+#endif
 /*----------------------------------------------------------------------------*/
 struct rb_manager
 {
@@ -25,7 +32,9 @@ struct rb_manager
 
 	rb_frag_queue_t free_fragq;		/* free fragment queue (for app thread) */
 	rb_frag_queue_t free_fragq_int;	/* free fragment quuee (only for mtcp) */
-
+#ifdef ENABLELRO
+	mtcp_manager_t mtcp;
+#endif
 } rb_manager;
 /*----------------------------------------------------------------------------*/
 uint32_t
@@ -66,7 +75,7 @@ RBPrintHex(struct tcp_ring_buffer* buff)
 }
 /*----------------------------------------------------------------------------*/
 rb_manager_t
-RBManagerCreate(size_t chunk_size, uint32_t cnum)
+RBManagerCreate(mtcp_manager_t mtcp, size_t chunk_size, uint32_t cnum)
 {
 	rb_manager_t rbm = (rb_manager_t) calloc(1, sizeof(rb_manager));
 
@@ -77,15 +86,26 @@ RBManagerCreate(size_t chunk_size, uint32_t cnum)
 
 	rbm->chunk_size = chunk_size;
 	rbm->cnum = cnum;
-	rbm->mp = (mem_pool_t)MPCreate(chunk_size, (uint64_t)chunk_size * cnum, 0);
+#if ! defined(DISABLE_DPDK) && ! defined(ENABLE_ONVM)
+	char pool_name[RTE_MEMPOOL_NAMESIZE];
+	sprintf(pool_name, "rbm_pool_%u", mtcp->ctx->cpu);
+	rbm->mp = (mem_pool_t)MPCreate(pool_name, chunk_size, (uint64_t)chunk_size * cnum);	
+#else
+	rbm->mp = (mem_pool_t)MPCreate(chunk_size, (uint64_t)chunk_size * cnum);
+#endif
 	if (!rbm->mp) {
 		TRACE_ERROR("Failed to allocate mp pool.\n");
 		free(rbm);
 		return NULL;
 	}
-
+#if ! defined(DISABLE_DPDK) && ! defined(ENABLE_ONVM)
+	sprintf(pool_name, "frag_mp_%u", mtcp->ctx->cpu);
+	rbm->frag_mp = (mem_pool_t)MPCreate(pool_name, sizeof(struct fragment_ctx), 
+					    sizeof(struct fragment_ctx) * cnum);	
+#else
 	rbm->frag_mp = (mem_pool_t)MPCreate(sizeof(struct fragment_ctx), 
-									sizeof(struct fragment_ctx) * cnum, 0);
+					    sizeof(struct fragment_ctx) * cnum);
+#endif
 	if (!rbm->frag_mp) {
 		TRACE_ERROR("Failed to allocate frag_mp pool.\n");
 		MPDestroy(rbm->mp);
@@ -111,6 +131,9 @@ RBManagerCreate(size_t chunk_size, uint32_t cnum)
 		return NULL;
 	}
 
+#ifdef ENABLELRO
+	rbm->mtcp = mtcp;
+#endif
 	return rbm;
 }
 /*----------------------------------------------------------------------------*/
@@ -181,6 +204,7 @@ RBInit(rb_manager_t rbm, uint32_t init_seq)
 	buff->data = MPAllocateChunk(rbm->mp);
 	if(!buff->data){
 		perror("rb_init MPAllocateChunk");
+		free(buff);
 		return NULL;
 	}
 
@@ -290,8 +314,13 @@ RBPut(rb_manager_t rbm, struct tcp_ring_buffer* buff,
 		buff->head_offset = 0;
 		buff->head = buff->data;
 	}
+#ifdef ENABLELRO
+	// copy data to buffer
+	__MEMCPY_DATA_2_BUFFER;
+#else
 	//copy data to buffer
 	memcpy(buff->head + putx, data, len);
+#endif
 	if (buff->tail_offset < buff->head_offset + end_off) 
 		buff->tail_offset = buff->head_offset + end_off;
 	buff->last_len = buff->tail_offset - buff->head_offset;

@@ -88,8 +88,8 @@ mtcp_pipe(mctx_t mctx, int pipeid[2])
 		FreeSocket(mctx, socket[0]->id, FALSE);
 		FreeSocket(mctx, socket[1]->id, FALSE);
 		free(pp->buf);
-		free(pp);
 		pthread_mutex_destroy(&pp->pipe_lock);
+		free(pp);
 		return -1;
 	}
 
@@ -230,7 +230,7 @@ PipeRead(mctx_t mctx, int pipeid, char *buf, int len)
 }
 /*---------------------------------------------------------------------------*/
 int 
-PipeWrite(mctx_t mctx, int pipeid, char *buf, int len)
+PipeWrite(mctx_t mctx, int pipeid, const char *buf, int len)
 {
 	mtcp_manager_t mtcp;
 	socket_map_t socket;

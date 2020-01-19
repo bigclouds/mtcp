@@ -59,7 +59,7 @@ GetMTCPManager(mctx_t mctx)
 	return g_mtcp[mctx->cpu];
 }
 /*----------------------------------------------------------------------------*/
-inline int 
+static inline int 
 GetSocketError(socket_map_t socket, void *optval, socklen_t *optlen)
 {
 	tcp_stream *cur_stream;
@@ -91,8 +91,126 @@ GetSocketError(socket_map_t socket, void *optval, socklen_t *optlen)
 		}
 	}
 
+	if (cur_stream->state == TCP_ST_SYN_SENT &&
+	    errno == EINPROGRESS) {
+		*(int *)optval = errno;
+		*optlen = sizeof(int);
+		return -1;
+	}
+
+	/*
+	 * `base case`: If socket sees no so_error, then
+	 * this also means close_reason will always be
+	 * TCP_NOT_CLOSED. 
+	 */
+	if (cur_stream->close_reason == TCP_NOT_CLOSED) {
+		*(int *)optval = 0;
+		*optlen = sizeof(int);		
+		
+		return 0;
+	}
+
 	errno = ENOSYS;
 	return -1;
+}
+/*----------------------------------------------------------------------------*/
+int
+mtcp_getsockname(mctx_t mctx, int sockid, struct sockaddr *addr,
+		 socklen_t *addrlen)
+{
+	mtcp_manager_t mtcp;
+	socket_map_t socket;
+	
+	mtcp = GetMTCPManager(mctx);
+	if (!mtcp) {
+		return -1;
+	}
+
+	if (sockid < 0 || sockid >= CONFIG.max_concurrency) {
+		TRACE_API("Socket id %d out of range.\n", sockid);
+		errno = EBADF;
+		return -1;
+	}
+	
+	socket = &mtcp->smap[sockid];
+	if (socket->socktype == MTCP_SOCK_UNUSED) {
+		TRACE_API("Invalid socket id: %d\n", sockid);
+		errno = EBADF;
+		return -1;
+	}
+
+	if (*addrlen <= 0) {
+		TRACE_API("Invalid addrlen: %d\n", *addrlen);
+		errno = EINVAL;
+		return -1;
+	}
+	
+	if (socket->socktype != MTCP_SOCK_LISTENER && 
+	    socket->socktype != MTCP_SOCK_STREAM) {
+		TRACE_API("Invalid socket id: %d\n", sockid);
+		errno = ENOTSOCK;
+		return -1;
+	}
+
+	*(struct sockaddr_in *)addr = socket->saddr;
+        *addrlen = sizeof(socket->saddr);
+
+	return 0;
+}
+/*----------------------------------------------------------------------------*/
+int
+mtcp_getpeername(mctx_t mctx, int sockid, struct sockaddr *addr,
+		 socklen_t *addrlen)
+{
+	mtcp_manager_t mtcp;
+	socket_map_t socket;
+	struct sockaddr_in *addr_in;
+	tcp_stream *stream;
+
+	mtcp = GetMTCPManager(mctx);
+        if (!mtcp) {
+		return -1;
+	}
+
+	if (sockid < 0 || sockid >= CONFIG.max_concurrency) {
+		TRACE_API("Socket id %d out of range.\n", sockid);
+		errno = EBADF;
+		return -1;
+	}
+
+	socket = &mtcp->smap[sockid];
+        if (socket->socktype == MTCP_SOCK_UNUSED) {
+		TRACE_API("Invalid socket id: %d\n", sockid);
+		errno = EBADF;
+		return -1;
+	}
+	
+	if (*addrlen <= 0) {
+		TRACE_API("Invalid addrlen: %d\n", *addrlen);
+		errno = EINVAL;
+		return -1;
+	}
+	
+	if (socket->socktype != MTCP_SOCK_LISTENER && 
+	    socket->socktype != MTCP_SOCK_STREAM) {
+		TRACE_API("Invalid socket id: %d\n", sockid);
+		errno = ENOTSOCK;
+		return -1;
+	}
+	
+	stream = socket->stream;
+	if (!mtcp_is_connected(mtcp, stream)) {
+		errno = ENOTCONN;
+		return -1;
+	}
+	
+	addr_in = (struct sockaddr_in *)addr;
+        addr_in->sin_family = AF_INET;
+        addr_in->sin_port = stream->dport;
+        addr_in->sin_addr.s_addr = stream->daddr;
+        *addrlen = sizeof(*addr_in);
+	
+	return 0;
 }
 /*----------------------------------------------------------------------------*/
 int 
@@ -220,7 +338,8 @@ mtcp_socket_ioctl(mctx_t mctx, int sockid, int request, void *argp)
 
 	/* only support stream socket */
 	socket = &mtcp->smap[sockid];
-	if (socket->socktype != MTCP_SOCK_STREAM) {
+	if (socket->socktype != MTCP_SOCK_STREAM &&
+	    socket->socktype != MTCP_SOCK_LISTENER) {
 		TRACE_API("Invalid socket id: %d\n", sockid);
 		errno = EBADF;
 		return -1;
@@ -247,6 +366,10 @@ mtcp_socket_ioctl(mctx_t mctx, int sockid, int request, void *argp)
 			*(int *)argp = 0;
 		}
 
+	} else if (request == FIONBIO) {
+		int32_t arg = *(int32_t *)argp;
+		if (arg != 0)
+			return mtcp_setsock_nonblock(mctx, sockid);
 	} else {
 		errno = EINVAL;
 		return -1;
@@ -272,7 +395,7 @@ mtcp_socket(mctx_t mctx, int domain, int type, int protocol)
 	}
 
 	if (type == SOCK_STREAM) {
-		type = MTCP_SOCK_STREAM;
+		type = (int)MTCP_SOCK_STREAM;
 	} else {
 		errno = EINVAL;
 		return -1;
@@ -384,6 +507,13 @@ mtcp_listen(mctx_t mctx, int sockid, int backlog)
 		return -1;
 	}
 
+	/* check whether we are not already listening on the same port */
+	if (ListenerHTSearch(mtcp->listeners, 
+			     &mtcp->smap[sockid].saddr.sin_port)) {
+		errno = EADDRINUSE;
+		return -1;
+	}
+
 	listener = (struct tcp_listener *)calloc(1, sizeof(struct tcp_listener));
 	if (!listener) {
 		/* errno set from the malloc() */
@@ -395,22 +525,27 @@ mtcp_listen(mctx_t mctx, int sockid, int backlog)
 	listener->socket = &mtcp->smap[sockid];
 
 	if (pthread_cond_init(&listener->accept_cond, NULL)) {
+		/* errno set internally */
 		perror("pthread_cond_init of ctx->accept_cond\n");
+		free(listener);
 		return -1;
 	}
 	if (pthread_mutex_init(&listener->accept_lock, NULL)) {
+		/* errno set internally */
 		perror("pthread_mutex_init of ctx->accept_lock\n");
+		free(listener);
 		return -1;
 	}
 
 	listener->acceptq = CreateStreamQueue(backlog);
 	if (!listener->acceptq) {
+		free(listener);
 		errno = ENOMEM;
 		return -1;
 	}
 	
 	mtcp->smap[sockid].listener = listener;
-	mtcp->listener = listener;
+	ListenerHTInsert(mtcp->listeners, listener);
 
 	return 0;
 }
@@ -479,7 +614,18 @@ mtcp_accept(mctx_t mctx, int sockid, struct sockaddr *addr, socklen_t *addrlen)
 		}
 		socket->stream = accepted;
 		accepted->socket = socket;
+
+		/* set socket parameters */
+		socket->saddr.sin_family = AF_INET;
+		socket->saddr.sin_port = accepted->dport;
+		socket->saddr.sin_addr.s_addr = accepted->daddr;
 	}
+
+	if (!(listener->socket->epoll & MTCP_EPOLLET) &&
+	    !StreamQueueIsEmpty(listener->acceptq))
+		AddEpollEvent(mtcp->ep, 
+			      USR_SHADOW_EVENT_QUEUE,
+			      listener->socket, MTCP_EPOLLIN);
 
 	TRACE_API("Stream %d accepted.\n", accepted->id);
 
@@ -500,19 +646,34 @@ mtcp_init_rss(mctx_t mctx, in_addr_t saddr_base, int num_addr,
 {
 	mtcp_manager_t mtcp;
 	addr_pool_t ap;
+	uint8_t is_external;
 
 	mtcp = GetMTCPManager(mctx);
 	if (!mtcp) {
+		errno = EACCES;
 		return -1;
 	}
 
+	if (mtcp->ap) {
+		TRACE_DBG("Destroying already exsiting address pool.\n"
+		          "Are you calling mtcp_init_rss() multiple times?\n");
+		DestroyAddressPool(mtcp->ap);
+		mtcp->ap = NULL;
+	}
+
 	if (saddr_base == INADDR_ANY) {
-		int nif_out;
+		int nif_out, eidx;
 
 		/* for the INADDR_ANY, find the output interface for the destination
 		   and set the saddr_base as the ip address of the output interface */
-		nif_out = GetOutputInterface(daddr);
-		saddr_base = CONFIG.eths[nif_out].ip_addr;
+		nif_out = GetOutputInterface(daddr, &is_external);
+		if (nif_out < 0) {
+			errno = EINVAL;
+			TRACE_DBG("Could not determine nif idx!\n");
+			return -1;
+		}
+		eidx = CONFIG.nif_to_eidx[nif_out];
+		saddr_base = CONFIG.eths[eidx].ip_addr;
 	}
 
 	ap = CreateAddressPoolPerCore(mctx->cpu, num_cpus, 
@@ -523,7 +684,8 @@ mtcp_init_rss(mctx_t mctx, in_addr_t saddr_base, int num_addr,
 	}
 
 	mtcp->ap = ap;
-
+	UNUSED(is_external);
+	
 	return 0;
 }
 /*----------------------------------------------------------------------------*/
@@ -538,7 +700,7 @@ mtcp_connect(mctx_t mctx, int sockid,
 	in_addr_t dip;
 	in_port_t dport;
 	int is_dyn_bound = FALSE;
-	int ret;
+	int ret, nif;
 
 	mtcp = GetMTCPManager(mctx);
 	if (!mtcp) {
@@ -592,25 +754,33 @@ mtcp_connect(mctx_t mctx, int sockid,
 	dport = addr_in->sin_port;
 
 	/* address binding */
-	if (socket->opts & MTCP_ADDR_BIND) {
+	if ((socket->opts & MTCP_ADDR_BIND) && 
+	    socket->saddr.sin_port != INPORT_ANY &&
+	    socket->saddr.sin_addr.s_addr != INADDR_ANY) {
 		int rss_core;
-		uint8_t endian_check = (current_iomodule_func == &dpdk_module_func) ?
-			0 : 1;
-	
+		uint8_t endian_check = FetchEndianType();
+		
 		rss_core = GetRSSCPUCore(socket->saddr.sin_addr.s_addr, dip, 
 					 socket->saddr.sin_port, dport, num_queues, endian_check);
-
+		
 		if (rss_core != mctx->cpu) {
 			errno = EINVAL;
 			return -1;
 		}
 	} else {
 		if (mtcp->ap) {
-			ret = FetchAddress(mtcp->ap, 
-					mctx->cpu, num_queues, addr_in, &socket->saddr);
+			ret = FetchAddressPerCore(mtcp->ap, 
+						  mctx->cpu, num_queues, addr_in, &socket->saddr);
 		} else {
-			ret = FetchAddress(ap, 
-					mctx->cpu, num_queues, addr_in, &socket->saddr);
+			uint8_t is_external;
+			nif = GetOutputInterface(dip, &is_external);
+			if (nif < 0) {
+				errno = EINVAL;
+				return -1;
+			}
+			ret = FetchAddress(ap[nif], 
+					   mctx->cpu, num_queues, addr_in, &socket->saddr);
+			UNUSED(is_external);
 		}
 		if (ret < 0) {
 			errno = EAGAIN;
@@ -930,6 +1100,24 @@ mtcp_abort(mctx_t mctx, int sockid)
 }
 /*----------------------------------------------------------------------------*/
 static inline int
+PeekForUser(mtcp_manager_t mtcp, tcp_stream *cur_stream, char *buf, int len)
+{
+	struct tcp_recv_vars *rcvvar = cur_stream->rcvvar;
+	int copylen;
+	
+	copylen = MIN(rcvvar->rcvbuf->merged_len, len);
+	if (copylen <= 0) {
+		errno = EAGAIN;
+		return -1;
+	}
+
+	/* Only copy data to user buffer */
+	memcpy(buf, rcvvar->rcvbuf->head, copylen);
+	
+	return copylen;
+}
+/*----------------------------------------------------------------------------*/
+static inline int
 CopyToUser(mtcp_manager_t mtcp, tcp_stream *cur_stream, char *buf, int len)
 {
 	struct tcp_recv_vars *rcvvar = cur_stream->rcvvar;
@@ -966,8 +1154,8 @@ CopyToUser(mtcp_manager_t mtcp, tcp_stream *cur_stream, char *buf, int len)
 	return copylen;
 }
 /*----------------------------------------------------------------------------*/
-int
-mtcp_read(mctx_t mctx, int sockid, char *buf, int len)
+ssize_t
+mtcp_recv(mctx_t mctx, int sockid, char *buf, size_t len, int flags)
 {
 	mtcp_manager_t mtcp;
 	socket_map_t socket;
@@ -975,25 +1163,25 @@ mtcp_read(mctx_t mctx, int sockid, char *buf, int len)
 	struct tcp_recv_vars *rcvvar;
 	int event_remaining;
 	int ret;
-
+	
 	mtcp = GetMTCPManager(mctx);
-	if (!mtcp) {
+        if (!mtcp) {
 		return -1;
 	}
-
+	
 	if (sockid < 0 || sockid >= CONFIG.max_concurrency) {
 		TRACE_API("Socket id %d out of range.\n", sockid);
 		errno = EBADF;
 		return -1;
 	}
-
+	
 	socket = &mtcp->smap[sockid];
-	if (socket->socktype == MTCP_SOCK_UNUSED) {
+        if (socket->socktype == MTCP_SOCK_UNUSED) {
 		TRACE_API("Invalid socket id: %d\n", sockid);
 		errno = EBADF;
 		return -1;
 	}
-
+	
 	if (socket->socktype == MTCP_SOCK_PIPE) {
 		return PipeRead(mctx, sockid, buf, len);
 	}
@@ -1003,18 +1191,18 @@ mtcp_read(mctx_t mctx, int sockid, char *buf, int len)
 		errno = ENOTSOCK;
 		return -1;
 	}
-
+	
 	/* stream should be in ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT */
 	cur_stream = socket->stream;
-	if (!cur_stream || 
-			!(cur_stream->state >= TCP_ST_ESTABLISHED && 
-			cur_stream->state <= TCP_ST_CLOSE_WAIT)) {
+        if (!cur_stream || 
+	    !(cur_stream->state >= TCP_ST_ESTABLISHED && 
+	      cur_stream->state <= TCP_ST_CLOSE_WAIT)) {
 		errno = ENOTCONN;
 		return -1;
 	}
 
 	rcvvar = cur_stream->rcvvar;
-
+	
 	/* if CLOSE_WAIT, return 0 if there is no payload */
 	if (cur_stream->state == TCP_ST_CLOSE_WAIT) {
 		if (!rcvvar->rcvbuf)
@@ -1022,8 +1210,8 @@ mtcp_read(mctx_t mctx, int sockid, char *buf, int len)
 		
 		if (rcvvar->rcvbuf->merged_len == 0)
 			return 0;
-	}
-
+        }
+	
 	/* return EAGAIN if no receive buffer */
 	if (socket->opts & MTCP_NONBLOCK) {
 		if (!rcvvar->rcvbuf || rcvvar->rcvbuf->merged_len == 0) {
@@ -1031,7 +1219,7 @@ mtcp_read(mctx_t mctx, int sockid, char *buf, int len)
 			return -1;
 		}
 	}
-
+	
 	SBUF_LOCK(&rcvvar->read_lock);
 #if BLOCKING_SUPPORT
 	if (!(socket->opts & MTCP_NONBLOCK)) {
@@ -1046,46 +1234,64 @@ mtcp_read(mctx_t mctx, int sockid, char *buf, int len)
 	}
 #endif
 
-	ret = CopyToUser(mtcp, cur_stream, buf, len);
-
+	switch (flags) {
+	case 0:
+		ret = CopyToUser(mtcp, cur_stream, buf, len);
+		break;
+	case MSG_PEEK:
+		ret = PeekForUser(mtcp, cur_stream, buf, len);
+		break;
+	default:
+		SBUF_UNLOCK(&rcvvar->read_lock);
+		ret = -1;
+		errno = EINVAL;
+		return ret;
+	}
+	
 	event_remaining = FALSE;
-	/* if there are remaining payload, generate EPOLLIN */
+        /* if there are remaining payload, generate EPOLLIN */
 	/* (may due to insufficient user buffer) */
 	if (socket->epoll & MTCP_EPOLLIN) {
 		if (!(socket->epoll & MTCP_EPOLLET) && rcvvar->rcvbuf->merged_len > 0) {
 			event_remaining = TRUE;
 		}
 	}
-	/* if waiting for close, notify it if no remaining data */
+        /* if waiting for close, notify it if no remaining data */
 	if (cur_stream->state == TCP_ST_CLOSE_WAIT && 
-			rcvvar->rcvbuf->merged_len == 0 && ret > 0) {
+	    rcvvar->rcvbuf->merged_len == 0 && ret > 0) {
 		event_remaining = TRUE;
 	}
 	
 	SBUF_UNLOCK(&rcvvar->read_lock);
-
+	
 	if (event_remaining) {
 		if (socket->epoll) {
 			AddEpollEvent(mtcp->ep, 
-					USR_SHADOW_EVENT_QUEUE, socket, MTCP_EPOLLIN);
+				      USR_SHADOW_EVENT_QUEUE, socket, MTCP_EPOLLIN);
 #if BLOCKING_SUPPORT
 		} else if (!(socket->opts & MTCP_NONBLOCK)) {
 			if (!cur_stream->on_rcv_br_list) {
 				cur_stream->on_rcv_br_list = TRUE;
 				TAILQ_INSERT_TAIL(&mtcp->rcv_br_list, 
-						cur_stream, rcvvar->rcv_br_link);
+						  cur_stream, rcvvar->rcv_br_link);
 				mtcp->rcv_br_list_cnt++;
 			}
 #endif
 		}
 	}
-
-	TRACE_API("Stream %d: mtcp_read() returning %d\n", cur_stream->id, ret);
-	return ret;
+	
+	TRACE_API("Stream %d: mtcp_recv() returning %d\n", cur_stream->id, ret);
+        return ret;
+}
+/*----------------------------------------------------------------------------*/
+inline ssize_t
+mtcp_read(mctx_t mctx, int sockid, char *buf, size_t len)
+{
+	return mtcp_recv(mctx, sockid, buf, len, 0);
 }
 /*----------------------------------------------------------------------------*/
 int
-mtcp_readv(mctx_t mctx, int sockid, struct iovec *iov, int numIOV)
+mtcp_readv(mctx_t mctx, int sockid, const struct iovec *iov, int numIOV)
 {
 	mtcp_manager_t mtcp;
 	socket_map_t socket;
@@ -1193,7 +1399,7 @@ mtcp_readv(mctx_t mctx, int sockid, struct iovec *iov, int numIOV)
 	SBUF_UNLOCK(&rcvvar->read_lock);
 
 	if(event_remaining) {
-		if (socket->epoll & MTCP_EPOLLIN && !(socket->epoll & MTCP_EPOLLET)) {
+		if ((socket->epoll & MTCP_EPOLLIN) && !(socket->epoll & MTCP_EPOLLET)) {
 			AddEpollEvent(mtcp->ep, 
 					USR_SHADOW_EVENT_QUEUE, socket, MTCP_EPOLLIN);
 #if BLOCKING_SUPPORT
@@ -1214,7 +1420,7 @@ mtcp_readv(mctx_t mctx, int sockid, struct iovec *iov, int numIOV)
 }
 /*----------------------------------------------------------------------------*/
 static inline int 
-CopyFromUser(mtcp_manager_t mtcp, tcp_stream *cur_stream, char *buf, int len)
+CopyFromUser(mtcp_manager_t mtcp, tcp_stream *cur_stream, const char *buf, int len)
 {
 	struct tcp_send_vars *sndvar = cur_stream->sndvar;
 	int sndlen;
@@ -1255,8 +1461,8 @@ CopyFromUser(mtcp_manager_t mtcp, tcp_stream *cur_stream, char *buf, int len)
 	return ret;
 }
 /*----------------------------------------------------------------------------*/
-int
-mtcp_write(mctx_t mctx, int sockid, char *buf, int len)
+ssize_t
+mtcp_write(mctx_t mctx, int sockid, const char *buf, size_t len)
 {
 	mtcp_manager_t mtcp;
 	socket_map_t socket;
@@ -1347,7 +1553,7 @@ mtcp_write(mctx_t mctx, int sockid, char *buf, int len)
 
 	/* if there are remaining sending buffer, generate write event */
 	if (sndvar->snd_wnd > 0) {
-		if (socket->epoll & MTCP_EPOLLOUT && !(socket->epoll & MTCP_EPOLLET)) {
+		if ((socket->epoll & MTCP_EPOLLOUT) && !(socket->epoll & MTCP_EPOLLET)) {
 			AddEpollEvent(mtcp->ep, 
 					USR_SHADOW_EVENT_QUEUE, socket, MTCP_EPOLLOUT);
 #if BLOCKING_SUPPORT
@@ -1367,7 +1573,7 @@ mtcp_write(mctx_t mctx, int sockid, char *buf, int len)
 }
 /*----------------------------------------------------------------------------*/
 int
-mtcp_writev(mctx_t mctx, int sockid, struct iovec *iov, int numIOV)
+mtcp_writev(mctx_t mctx, int sockid, const struct iovec *iov, int numIOV)
 {
 	mtcp_manager_t mtcp;
 	socket_map_t socket;
@@ -1457,7 +1663,7 @@ mtcp_writev(mctx_t mctx, int sockid, struct iovec *iov, int numIOV)
 
 	/* if there are remaining sending buffer, generate write event */
 	if (sndvar->snd_wnd > 0) {
-		if (socket->epoll & MTCP_EPOLLOUT && !(socket->epoll & MTCP_EPOLLET)) {
+		if ((socket->epoll & MTCP_EPOLLOUT) && !(socket->epoll & MTCP_EPOLLET)) {
 			AddEpollEvent(mtcp->ep, 
 					USR_SHADOW_EVENT_QUEUE, socket, MTCP_EPOLLOUT);
 #if BLOCKING_SUPPORT

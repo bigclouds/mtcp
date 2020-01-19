@@ -3,6 +3,7 @@
 #include <time.h>
 #include <signal.h>
 #include <assert.h>
+#include <fcntl.h>
 
 #include "mtcp.h"
 #include "tcp_stream.h"
@@ -85,6 +86,36 @@ DestroyEventQueue(struct event_queue *eq)
 	free(eq);
 }
 /*----------------------------------------------------------------------------*/
+int
+mtcp_epoll_create1(mctx_t mctx, int flags)
+{
+	int rc;
+	struct mtcp_conf mcfg;
+
+	rc = 0;
+	mtcp_getconf(&mcfg);
+	
+	switch (flags) {
+	case 0:
+		/* do nothing */
+	case O_CLOEXEC:
+		/*
+		 * this won't work since mTCP apps 
+		 * assume that user does not fork/exec
+		 */
+		rc = mtcp_epoll_create(mctx, mcfg.max_concurrency * 3);
+		break;
+	default:
+		TRACE_ERROR("[CPU %d] Invalid flags for %s set!\n",
+			    mctx->cpu, __FUNCTION__);
+		errno = EINVAL;
+		rc = -1;
+		break;
+	}
+	
+	return rc;
+}
+/*----------------------------------------------------------------------------*/
 int 
 mtcp_epoll_create(mctx_t mctx, int size)
 {
@@ -111,31 +142,48 @@ mtcp_epoll_create(mctx_t mctx, int size)
 
 	/* create event queues */
 	ep->usr_queue = CreateEventQueue(size);
-	if (!ep->usr_queue)
+	if (!ep->usr_queue) {
+		FreeSocket(mctx, epsocket->id, FALSE);
+		free(ep);
 		return -1;
+	}
 
 	ep->usr_shadow_queue = CreateEventQueue(size);
 	if (!ep->usr_shadow_queue) {
 		DestroyEventQueue(ep->usr_queue);
+		FreeSocket(mctx, epsocket->id, FALSE);
+		free(ep);
 		return -1;
 	}
 
 	ep->mtcp_queue = CreateEventQueue(size);
 	if (!ep->mtcp_queue) {
-		DestroyEventQueue(ep->usr_queue);
 		DestroyEventQueue(ep->usr_shadow_queue);
+		DestroyEventQueue(ep->usr_queue);
+		FreeSocket(mctx, epsocket->id, FALSE);
+		free(ep);
 		return -1;
 	}
 
-	TRACE_EPOLL("epoll structure of size %d created.\n", ep->size);
+	TRACE_EPOLL("epoll structure of size %d created.\n", size);
 
 	mtcp->ep = ep;
 	epsocket->ep = ep;
 
 	if (pthread_mutex_init(&ep->epoll_lock, NULL)) {
+		DestroyEventQueue(ep->mtcp_queue);
+		DestroyEventQueue(ep->usr_shadow_queue);
+		DestroyEventQueue(ep->usr_queue);
+		FreeSocket(mctx, epsocket->id, FALSE);
+		free(ep);
 		return -1;
 	}
 	if (pthread_cond_init(&ep->epoll_cond, NULL)) {
+		DestroyEventQueue(ep->mtcp_queue);
+		DestroyEventQueue(ep->usr_shadow_queue);
+		DestroyEventQueue(ep->usr_queue);
+		FreeSocket(mctx, epsocket->id, FALSE);
+		free(ep);
 		return -1;
 	}
 
@@ -162,7 +210,6 @@ CloseEpollSocket(mctx_t mctx, int epid)
 	DestroyEventQueue(ep->usr_queue);
 	DestroyEventQueue(ep->usr_shadow_queue);
 	DestroyEventQueue(ep->mtcp_queue);
-	free(ep);
 
 	pthread_mutex_lock(&ep->epoll_lock);
 	mtcp->ep = NULL;
@@ -172,6 +219,7 @@ CloseEpollSocket(mctx_t mctx, int epid)
 
 	pthread_cond_destroy(&ep->epoll_cond);
 	pthread_mutex_destroy(&ep->epoll_lock);
+	free(ep);
 
 	return 0;
 }
@@ -205,8 +253,7 @@ RaisePendingStreamEvents(mtcp_manager_t mtcp,
 	/* same thing to the write event */
 	if (socket->epoll & MTCP_EPOLLOUT) {
 		struct tcp_send_vars *sndvar = stream->sndvar;
-		if (!sndvar->sndbuf || 
-				(sndvar->sndbuf && sndvar->sndbuf->len < sndvar->snd_wnd)) {
+		if (!sndvar->sndbuf || (sndvar->sndbuf && sndvar->snd_wnd > 0)) {
 			if (!(socket->events & MTCP_EPOLLOUT)) {
 				TRACE_EPOLL("Socket %d: Adding write event\n", socket->id);
 				AddEpollEvent(ep, USR_SHADOW_EVENT_QUEUE, socket, MTCP_EPOLLOUT);
@@ -386,12 +433,14 @@ wait:
 			struct timespec deadline;
 
 			clock_gettime(CLOCK_REALTIME, &deadline);
-			if (timeout > 1000) {
+			if (timeout >= 1000) {
 				int sec;
 				sec = timeout / 1000;
 				deadline.tv_sec += sec;
 				timeout -= sec * 1000;
 			}
+
+			deadline.tv_nsec += timeout * 1000000;
 
 			if (deadline.tv_nsec >= 1000000000) {
 				deadline.tv_sec++;

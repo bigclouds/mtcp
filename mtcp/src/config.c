@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <limits.h>
 
 #include "mtcp.h"
 #include "config.h"
@@ -20,12 +21,65 @@
 /* for if_nametoindex */
 #include <net/if.h>
 
-#define MAX_OPTLINE_LEN 1024
-#define ALL_STRING "all"
+#define MAX_ROUTE_ENTRY 			64
+#define MAX_OPTLINE_LEN 			1024
+#define ALL_STRING 				"all"
 
-static const char *route_file = "config/route.conf";
-static const char *arp_file = "config/arp.conf";
+static const char *route_file = 		"config/route.conf";
+static const char *arp_file = 			"config/arp.conf";
+struct mtcp_manager *g_mtcp[MAX_CPUS] = 	{NULL};
+struct mtcp_config CONFIG = {
+	/* set default configuration */
+	.max_concurrency  =			10000,
+	.max_num_buffers  =			10000,
+	.rcvbuf_size	  =			-1,
+	.sndbuf_size	  =			-1,
+	.tcp_timeout	  =			TCP_TIMEOUT,
+	.tcp_timewait	  =			TCP_TIMEWAIT,
+	.num_mem_ch	  =			0,
+#if USE_CCP
+	.cc           	  =         		"reno\n",
+#endif
+#ifdef ENABLE_ONVM
+	.onvm_inst	  =			(uint16_t) -1,
+	.onvm_dest	  =			(uint16_t) -1,
+	.onvm_serv	  =			(uint16_t) -1
+#endif
+};
+addr_pool_t ap[ETH_NUM] = 			{NULL};
+static char port_list[MAX_OPTLINE_LEN] = 	"";
+static char port_stat_list[MAX_OPTLINE_LEN] = 	"";
+/* total cpus detected in the mTCP stack*/
+int num_cpus;
+/* this should be equal to num_cpus */
+int num_queues;
+int num_devices;
 
+int num_devices_attached;
+int devices_attached[MAX_DEVICES];
+/*----------------------------------------------------------------------------*/
+static inline int
+mystrtol(const char *nptr, int base)
+{
+	int rval;
+	char *endptr;
+
+	errno = 0;
+	rval = strtol(nptr, &endptr, 10);
+	/* check for strtol errors */
+	if ((errno == ERANGE && (rval == LONG_MAX ||
+				 rval == LONG_MIN))
+	    || (errno != 0 && rval == 0)) {
+		perror("strtol");
+		exit(EXIT_FAILURE);
+	}
+	if (endptr == nptr) {
+		TRACE_CONFIG("Parsing strtol error!\n");
+		exit(EXIT_FAILURE);
+	}
+
+	return rval;
+}
 /*----------------------------------------------------------------------------*/
 static int 
 GetIntValue(char* value)
@@ -58,23 +112,29 @@ EnrollRouteTableEntry(char *optstr)
 {
 	char *daddr_s;
 	char *prefix;
+#ifdef DISABLE_NETMAP 
 	char *dev;
+	int i;
+#endif
 	int ifidx;
 	int ridx;
-	int i;
-	char * saveptr;
-
+	char *saveptr;
+ 
+	saveptr = NULL;
 	daddr_s = strtok_r(optstr, "/", &saveptr);
 	prefix = strtok_r(NULL, " ", &saveptr);
+#ifdef DISABLE_NETMAP
 	dev = strtok_r(NULL, "\n", &saveptr);
-
+#endif
 	assert(daddr_s != NULL);
 	assert(prefix != NULL);
+#ifdef DISABLE_NETMAP	
 	assert(dev != NULL);
+#endif
 
 	ifidx = -1;
-	/* XXX - This needs to be revised */
 	if (current_iomodule_func == &ps_module_func) {
+#ifndef DISABLE_PSIO		
 		for (i = 0; i < num_devices; i++) {
 			if (strcmp(dev, devices[i].name) != 0)
 				continue;
@@ -86,18 +146,28 @@ EnrollRouteTableEntry(char *optstr)
 			TRACE_CONFIG("Interface %s does not exist!\n", dev);
 			exit(4);
 		}
-	} else if (current_iomodule_func == &dpdk_module_func) {
+#endif
+	} else if (current_iomodule_func == &dpdk_module_func ||
+		   current_iomodule_func == &onvm_module_func) {
+#ifndef DISABLE_DPDK
 		for (i = 0; i < num_devices; i++) {
 			if (strcmp(CONFIG.eths[i].dev_name, dev))
 				continue;
 			ifidx = CONFIG.eths[i].ifindex;
 			break;
 		}
+#endif
 	}
 
 	ridx = CONFIG.routes++;
+	if (ridx == MAX_ROUTE_ENTRY) {
+		TRACE_CONFIG("Maximum routing entry limit (%d) has been reached."
+		             "Consider increasing MAX_ROUTE_ENTRY.\n", MAX_ROUTE_ENTRY);
+		exit(4);
+	}
+
 	CONFIG.rtable[ridx].daddr = inet_addr(daddr_s);
-	CONFIG.rtable[ridx].prefix = atoi(prefix);
+	CONFIG.rtable[ridx].prefix = mystrtol(prefix, 10);
 	if (CONFIG.rtable[ridx].prefix > 32 || CONFIG.rtable[ridx].prefix < 0) {
 		TRACE_CONFIG("Prefix length should be between 0 - 32.\n");
 		exit(4);
@@ -107,6 +177,11 @@ EnrollRouteTableEntry(char *optstr)
 	CONFIG.rtable[ridx].masked = 
 			CONFIG.rtable[ridx].daddr & CONFIG.rtable[ridx].mask;
 	CONFIG.rtable[ridx].nif = ifidx;
+
+	if (CONFIG.rtable[ridx].mask == 0) {
+		TRACE_CONFIG("Default Route GW set!\n");
+		CONFIG.gateway = &CONFIG.rtable[ridx];
+	}	
 }
 /*----------------------------------------------------------------------------*/
 int 
@@ -130,7 +205,7 @@ SetRoutingTableFromFile()
 	while (1) {
 		char *iscomment;
 		int num;
-
+  
 		if (fgets(optstr, MAX_OPTLINE_LEN, fc) == NULL)
 			break;
 
@@ -154,7 +229,14 @@ SetRoutingTableFromFile()
 					i -= 1;
 					continue;
 				}
-				EnrollRouteTableEntry(optstr);
+				if (!CONFIG.gateway)
+					EnrollRouteTableEntry(optstr);
+				else {
+					TRACE_ERROR("Default gateway settings in %s should "
+						    "always come as last entry!\n",
+						    route_file);
+					exit(EXIT_FAILURE);
+				}	
 			}
 		}
 	}
@@ -198,6 +280,7 @@ ParseMACAddress(unsigned char *haddr, char *haddr_str)
 	unsigned int temp;
 	char *saveptr = NULL;
 
+	saveptr = NULL;
 	str = strtok_r(haddr_str, ":", &saveptr);
 	i = 0;
 	while (str != NULL) {
@@ -205,7 +288,10 @@ ParseMACAddress(unsigned char *haddr, char *haddr_str)
 			TRACE_CONFIG("MAC address length exceeds %d!\n", ETH_ALEN);
 			exit(4);
 		}
-		sscanf(str, "%x", &temp);
+		if (sscanf(str, "%x", &temp) < 1) {
+			TRACE_CONFIG("sscanf failed!\n");
+			exit(4);
+		}
 		haddr[i++] = temp;
 		str = strtok_r(NULL, ":", &saveptr);
 	}
@@ -241,7 +327,7 @@ SetRoutingTable()
 
 	CONFIG.routes = 0;
 	CONFIG.rtable = (struct route_table *)
-			calloc(MAX_DEVICES, sizeof(struct route_table));
+			calloc(MAX_ROUTE_ENTRY, sizeof(struct route_table));
 	if (!CONFIG.rtable) 
 		exit(EXIT_FAILURE);
 
@@ -313,7 +399,8 @@ EnrollARPTableEntry(char *optstr)
 	int idx;
 
 	char *saveptr;
-
+	
+	saveptr = NULL;
 	dip_s = strtok_r(optstr, "/", &saveptr);
 	prefix_s = strtok_r(NULL, " ", &saveptr);
 	daddr_s = strtok_r(NULL, "\n", &saveptr);
@@ -325,14 +412,15 @@ EnrollARPTableEntry(char *optstr)
 	if (prefix_s == NULL)
 		prefix = 32;
 	else
-		prefix = atoi(prefix_s);
+		prefix = mystrtol(prefix_s, 10);
 
 	if (prefix > 32 || prefix < 0) {
 		TRACE_CONFIG("Prefix length should be between 0 - 32.\n");
 		return;
 	}
-	
+
 	idx = CONFIG.arp.entries++;
+
 	CONFIG.arp.entry[idx].prefix = prefix;
 	ParseIPAddress(&CONFIG.arp.entry[idx].ip, dip_s);
 	ParseMACAddress(CONFIG.arp.entry[idx].haddr, daddr_s);
@@ -340,7 +428,13 @@ EnrollARPTableEntry(char *optstr)
 	dip_mask = MaskFromPrefix(prefix);
 	CONFIG.arp.entry[idx].ip_mask = dip_mask;
 	CONFIG.arp.entry[idx].ip_masked = CONFIG.arp.entry[idx].ip & dip_mask;
-	
+	if (CONFIG.gateway && ((CONFIG.gateway)->daddr &
+			       CONFIG.arp.entry[idx].ip_mask) ==
+	    CONFIG.arp.entry[idx].ip_masked) {
+		CONFIG.arp.gateway = &CONFIG.arp.entry[idx];
+		TRACE_CONFIG("ARP Gateway SET!\n");
+	}
+
 /*
 	int i, cnt;
 	cnt = 1;
@@ -400,14 +494,14 @@ LoadARPTable()
 			numEntry = GetIntValue(p + sizeof(ARP_ENTRY));
 			if (numEntry <= 0) {
 				fprintf(stderr, "Wrong entry in arp.conf: %s\n", p);
-				exit(-1);
+				exit(EXIT_FAILURE);
 			}
 #if 0
 			CONFIG.arp.entry = (struct arp_entry *)
 				calloc(numEntry + MAX_ARPENTRY, sizeof(struct arp_entry));
 			if (CONFIG.arp.entry == NULL) {
 				fprintf(stderr, "Wrong entry in arp.conf: %s\n", p);
-				exit(-1);
+				exit(EXIT_FAILURE);
 			}
 #endif
 			hasNumEntry = 1;
@@ -416,7 +510,7 @@ LoadARPTable()
 				fprintf(stderr, 
 						"Error in arp.conf: more entries than "
 						"are specifed, entry=%s\n", p);
-				exit(-1);
+				exit(EXIT_FAILURE);
 			}
 			EnrollARPTableEntry(p);
 			numEntry--;
@@ -426,7 +520,7 @@ LoadARPTable()
 	fclose(fc);
 	return 0;
 }
-/*----------------------------------------------------------------------------*/
+/*----------------------------------------------------------------------------*/	
 static int
 SetMultiProcessSupport(char *multiprocess_details)
 {
@@ -434,20 +528,28 @@ SetMultiProcessSupport(char *multiprocess_details)
 	char *sample;
 	char *saveptr;
 
-	TRACE_CONFIG("Loading multi-process configuration\n");
-
+	saveptr = NULL;
 	sample = strtok_r(multiprocess_details, token, &saveptr);
 	if (sample == NULL) {
 		TRACE_CONFIG("No option for multi-process support given!\n");
 		return -1;
 	}
-	CONFIG.multi_process_curr_core = atoi(sample);
-	
-	sample = strtok_r(NULL, token, &saveptr);
-	if (sample != NULL && !strcmp(sample, "master"))
-		CONFIG.multi_process_is_master = 1;
-	
+	CONFIG.multi_process = mystrtol(sample, 10);
+	TRACE_CONFIG("Loading multi-process configuration: %d\n",
+		     CONFIG.multi_process);	
 	return 0;
+}
+/*----------------------------------------------------------------------------*/
+static inline void
+SaveInterfaceInfo(char *dev_name_list)
+{
+	strcpy(port_list, dev_name_list);
+}
+/*----------------------------------------------------------------------------*/
+static inline void
+SaveInterfaceStatList(char *dev_name_list)
+{
+	strcpy(port_stat_list, dev_name_list);
 }
 /*----------------------------------------------------------------------------*/
 static int 
@@ -459,6 +561,7 @@ ParseConfiguration(char *line)
 	char *saveptr;
 
 	strncpy(optstr, line, MAX_OPTLINE_LEN - 1);
+	saveptr = NULL;
 
 	p = strtok_r(optstr, " \t=", &saveptr);
 	if (p == NULL) {
@@ -473,7 +576,7 @@ ParseConfiguration(char *line)
 	}
 
 	if (strcmp(p, "num_cores") == 0) {
-		CONFIG.num_cores = atoi(q);
+		CONFIG.num_cores = mystrtol(q, 10);
 		if (CONFIG.num_cores <= 0) {
 			TRACE_CONFIG("Number of cores should be larger than 0.\n");
 			return -1;
@@ -484,62 +587,80 @@ ParseConfiguration(char *line)
 			return -1;
 		}
 		num_cpus = CONFIG.num_cores;
+	} else if (strcmp(p, "core_mask") == 0) {
+#ifndef DISABLE_DPDK
+		mpz_set_str(CONFIG._cpumask, q, 16);
+#endif
 	} else if (strcmp(p, "max_concurrency") == 0) {
-		CONFIG.max_concurrency = atoi(q);
+		CONFIG.max_concurrency = mystrtol(q, 10);
 		if (CONFIG.max_concurrency < 0) {
 			TRACE_CONFIG("The maximum concurrency should be larger than 0.\n");
 			return -1;
 		}
 	} else if (strcmp(p, "max_num_buffers") == 0) {
-		CONFIG.max_num_buffers = atoi(q);
+		CONFIG.max_num_buffers = mystrtol(q, 10);
 		if (CONFIG.max_num_buffers < 0) {
 			TRACE_CONFIG("The maximum # buffers should be larger than 0.\n");
 			return -1;
 		}
 	} else if (strcmp(p, "rcvbuf") == 0) {
-		CONFIG.rcvbuf_size = atoi(q);
+		CONFIG.rcvbuf_size = mystrtol(q, 10);
 		if (CONFIG.rcvbuf_size < 64) {
 			TRACE_CONFIG("Receive buffer size should be larger than 64.\n");
 			return -1;
 		}
 	} else if (strcmp(p, "sndbuf") == 0) {
-		CONFIG.sndbuf_size = atoi(q);
+		CONFIG.sndbuf_size = mystrtol(q, 10);
 		if (CONFIG.sndbuf_size < 64) {
 			TRACE_CONFIG("Send buffer size should be larger than 64.\n");
 			return -1;
 		}
 	} else if (strcmp(p, "tcp_timeout") == 0) {
-		CONFIG.tcp_timeout = atoi(q);
+		CONFIG.tcp_timeout = mystrtol(q, 10);
 		if (CONFIG.tcp_timeout > 0) {
 			CONFIG.tcp_timeout = SEC_TO_USEC(CONFIG.tcp_timeout) / TIME_TICK;
 		}
 	} else if (strcmp(p, "tcp_timewait") == 0) {
-		CONFIG.tcp_timewait = atoi(q);
+		CONFIG.tcp_timewait = mystrtol(q, 10);
 		if (CONFIG.tcp_timewait > 0) {
 			CONFIG.tcp_timewait = SEC_TO_USEC(CONFIG.tcp_timewait) / TIME_TICK;
 		}
 	} else if (strcmp(p, "stat_print") == 0) {
-		int i;
-
-		for (i = 0; i < CONFIG.eths_num; i++) {
-			if (strcmp(CONFIG.eths[i].dev_name, q) == 0) {
-				CONFIG.eths[i].stat_print = TRUE;
-			}
-		}
+		SaveInterfaceStatList(line + strlen(p) + 1);
 	} else if (strcmp(p, "port") == 0) {
-		if(strncmp(q, ALL_STRING, sizeof(ALL_STRING)) == 0) {
-			SetInterfaceInfo(q);
-		} else {
-			SetInterfaceInfo(line + strlen(p) + 1);
-		}
+		if(strncmp(q, ALL_STRING, sizeof(ALL_STRING)) == 0)
+			SaveInterfaceInfo(q);
+		else
+			SaveInterfaceInfo(line + strlen(p) + 1);
 	} else if (strcmp(p, "io") == 0) {
 		AssignIOModule(q);
+		if (CheckIOModuleAccessPermissions() == -1) {
+			TRACE_CONFIG("[CAUTION] Run the app as root!\n");
+			exit(EXIT_FAILURE);
+		}
 	} else if (strcmp(p, "num_mem_ch") == 0) {
-		CONFIG.num_mem_ch = atoi(q);
+		CONFIG.num_mem_ch = mystrtol(q, 10);
+#ifdef ENABLE_ONVM
+	} else if (strcmp(p, "onvm_inst") == 0) {
+		CONFIG.onvm_inst = mystrtol(q, 10);
+	} else if (strcmp(p, "onvm_serv") == 0) {
+		CONFIG.onvm_serv = mystrtol(q, 10);
+	} else if (strcmp(p, "onvm_dest") == 0) {
+		CONFIG.onvm_dest = mystrtol(q, 10);
+#endif
 	} else if (strcmp(p, "multiprocess") == 0) {
-		CONFIG.multi_process = 1;
 		SetMultiProcessSupport(line + strlen(p) + 1);
-	} else {
+    } else if (strcmp(p, "cc") == 0) {
+#if USE_CCP
+        // ignore the parsing done by the second strtok_r so that we can get the full param string
+        *strchr(q, '\0') = ' ';
+        strcpy(CONFIG.cc, q);
+#else
+        TRACE_CONFIG("[WARNING] 'cc' option provided, but CCP not enabled. define USE_CCP!\n");
+        exit(EXIT_FAILURE);
+#endif
+
+    } else {
 		TRACE_CONFIG("Unknown option type: %s\n", line);
 		return -1;
 	}
@@ -548,7 +669,7 @@ ParseConfiguration(char *line)
 }
 /*----------------------------------------------------------------------------*/
 int 
-LoadConfiguration(char *fname)
+LoadConfiguration(const char *fname)
 {
 	FILE *fp;
 	char optstr[MAX_OPTLINE_LEN];
@@ -564,16 +685,9 @@ LoadConfiguration(char *fname)
 		return -1;
 	}
 
-	/* set default configuration */
-	CONFIG.num_cores = num_cpus;
-	CONFIG.max_concurrency = 100000;
-	CONFIG.max_num_buffers = 100000;
-	CONFIG.rcvbuf_size = 8192;
-	CONFIG.sndbuf_size = 8192;
-	CONFIG.tcp_timeout = TCP_TIMEOUT;
-	CONFIG.tcp_timewait = TCP_TIMEWAIT;
-	CONFIG.num_mem_ch = 0;
-
+#ifndef DISABLE_DPDK
+	mpz_init(CONFIG._cpumask);
+#endif
 	while (1) {
 		char *p;
 		char *temp;
@@ -595,12 +709,26 @@ LoadConfiguration(char *fname)
 		if (*p == 0) /* nothing more to process? */
 			continue;
 
-		if (ParseConfiguration(p) < 0)
+		if (ParseConfiguration(p) < 0) {
+			fclose(fp);
 			return -1;
+		}
 	}
 
 	fclose(fp);
 
+	/* if rcvbuf is set but sndbuf is not, sndbuf = rcvbuf */
+	if (CONFIG.sndbuf_size == -1 && CONFIG.rcvbuf_size != -1)
+		CONFIG.sndbuf_size = CONFIG.rcvbuf_size;
+	/* if sndbuf is set but rcvbuf is not, rcvbuf = sndbuf */
+	if (CONFIG.rcvbuf_size == -1 && CONFIG.sndbuf_size != -1)
+		CONFIG.rcvbuf_size = CONFIG.sndbuf_size;
+	/* if sndbuf & rcvbuf are not set, rcvbuf = sndbuf = 8192 */
+	if (CONFIG.rcvbuf_size == -1 && CONFIG.sndbuf_size == -1)
+		CONFIG.sndbuf_size = CONFIG.rcvbuf_size = 8192;
+	
+	return SetNetEnv(port_list, port_stat_list);
+	
 	return 0;
 }
 /*----------------------------------------------------------------------------*/
@@ -615,8 +743,7 @@ PrintConfiguration()
 	TRACE_CONFIG("Maximum number of concurrency per core: %d\n", 
 			CONFIG.max_concurrency);
 	if (CONFIG.multi_process == 1) {
-		TRACE_CONFIG("Multi-process support is enabled and current core is: %d\n",
-			     CONFIG.multi_process_curr_core);
+		TRACE_CONFIG("Multi-process support is enabled\n");
 		if (CONFIG.multi_process_is_master == 1)
 			TRACE_CONFIG("Current core is master (for multi-process)\n");
 		else

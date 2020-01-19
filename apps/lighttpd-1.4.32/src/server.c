@@ -500,6 +500,9 @@ core_affinitize(int cpu)
 	size_t n;
 	int ret;
 
+#ifdef USE_MTCP
+	return mtcp_core_affinitize(cpu);
+#endif
 	n = sysconf(_SC_NPROCESSORS_ONLN);
 
 	if (cpu < 0 || cpu >= (int) n) {
@@ -1196,7 +1199,7 @@ show_help(void) {
 " -f <name>  filename of the config-file\n" \
 " -m <name>  module directory (default: "LIBRARY_DIR")\n" \
 " -p         print the parsed config-file in internal form, and exit\n" \
-" -c <#cpus> number of cpu cores that lighttpd will use\n" \
+" -n <#cpus> number of cpu cores that lighttpd will use\n" \
 " -t         test the config-file, and exit\n" \
 " -D         don't go to background (default: go to background)\n" \
 " -v         show version\n" \
@@ -1592,16 +1595,13 @@ main(int argc, char **argv) {
 	 */
 	mtcp_getconf(&mcfg);
 	mcfg.num_cores = cpus;
+	mcfg.max_concurrency = mcfg.max_num_buffers = srv->max_conns;
 	mtcp_setconf(&mcfg);
 	/* initialize the mtcp context */
 	if (mtcp_init("mtcp.conf")) {
 		fprintf(stderr, "Failed to initialize mtcp\n");
 		goto clean_up;
 	}
-
-	mtcp_getconf(&mcfg);
-	mcfg.max_concurrency = mcfg.max_num_buffers = srv_states[0]->max_conns;
-	mtcp_setconf(&mcfg);
 
 	/* register SIGINT signal handler */
 	mtcp_register_signal(SIGINT, signal_handler);
@@ -1616,6 +1616,7 @@ main(int argc, char **argv) {
 				   start_server, (void *)srv_states[i])) {
 		  goto clean_up;
 		}
+		sleep(1);
 	}
 
 	/*
@@ -1905,6 +1906,7 @@ main(int argc, char **argv) {
 
 	/* This part of code is only executed in the single-process, single-threaded version (non-mtcp/non-multithreaded) */
 	/* Under USE_MTCP settings, each individual `running_thread' executes the `main-loop' */
+	/* In USE_MTCP settings main thread will execute the flowing step */
 	/* main-loop */
 	while (!srv_shutdown) {
 		int n;

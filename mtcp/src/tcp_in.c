@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <time.h>
+#include <inttypes.h>
 
 #include "tcp_util.h"
 #include "tcp_in.h"
@@ -8,6 +10,10 @@
 #include "debug.h"
 #include "timer.h"
 #include "ip_in.h"
+#include "clock.h"
+#if USE_CCP
+#include "ccp.h"
+#endif
 
 #define MAX(a, b) ((a)>(b)?(a):(b))
 #define MIN(a, b) ((a)<(b)?(a):(b))
@@ -21,16 +27,16 @@ static inline int
 FilterSYNPacket(mtcp_manager_t mtcp, uint32_t ip, uint16_t port)
 {
 	struct sockaddr_in *addr;
+	struct tcp_listener *listener;
 
 	/* TODO: This listening logic should be revised */
 
-	/* if not listening, drop */
-	if (!mtcp->listener) {
-		return FALSE;
-	}
-
 	/* if not the address we want, drop */
-	addr = &mtcp->listener->socket->saddr;
+	listener = (struct tcp_listener *)ListenerHTSearch(mtcp->listeners, &port);
+	if (listener == NULL)	return FALSE;
+
+	addr = &listener->socket->saddr;
+
 	if (addr->sin_port == port) {
 		if (addr->sin_addr.s_addr != INADDR_ANY) {
 			if (ip == addr->sin_addr.s_addr) {
@@ -88,7 +94,7 @@ HandleActiveOpen(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_ts,
 	ParseTCPOptions(cur_stream, cur_ts, (uint8_t *)tcph + TCP_HEADER_LEN, 
 			(tcph->doff << 2) - TCP_HEADER_LEN);
 	cur_stream->sndvar->cwnd = ((cur_stream->sndvar->cwnd == 1)? 
-			(cur_stream->sndvar->mss * 2): cur_stream->sndvar->mss);
+			(cur_stream->sndvar->mss * TCP_INIT_CWND): cur_stream->sndvar->mss);
 	cur_stream->sndvar->ssthresh = cur_stream->sndvar->mss * 10;
 	UpdateRetransmissionTimer(mtcp, cur_stream, cur_ts);
 
@@ -205,7 +211,7 @@ ProcessRST(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t ack_seq)
 	}
 
 	if (cur_stream->state == TCP_ST_SYN_RCVD) {
-		if (ack_seq == cur_stream->rcv_nxt) {
+		if (ack_seq == cur_stream->snd_nxt) {
 			cur_stream->state = TCP_ST_CLOSED;
 			cur_stream->close_reason = TCP_RESET;
 			DestroyTCPStream(mtcp, cur_stream);
@@ -298,6 +304,7 @@ EstimateRTT(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t mrtt)
 			rcvvar->srtt, TS_TO_MSEC((rcvvar->srtt) >> 3), rcvvar->mdev, 
 			rcvvar->mdev_max, rcvvar->rttvar, rcvvar->rtt_seq);
 }
+
 /*----------------------------------------------------------------------------*/
 static inline void
 ProcessACK(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_ts, 
@@ -378,32 +385,61 @@ ProcessACK(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_ts,
 			if (cur_stream->rcvvar->snd_wl2 + sndvar->peer_wnd == right_wnd_edge) {
 				if (cur_stream->rcvvar->dup_acks + 1 > cur_stream->rcvvar->dup_acks) {
 					cur_stream->rcvvar->dup_acks++;
+#if USE_CCP
+					ccp_record_event(mtcp, cur_stream, EVENT_DUPACK,
+							 (cur_stream->snd_nxt - ack_seq));
+#endif
 				}
 				dup = TRUE;
 			}
 		}
 	}
 	if (!dup) {
+#if USE_CCP
+		if (cur_stream->rcvvar->dup_acks >= 3) {
+			TRACE_DBG("passed dup_acks, ack=%u, snd_nxt=%u, last_ack=%u len=%u wl2=%u peer_wnd=%u right=%u\n",
+				  ack_seq-sndvar->iss, cur_stream->snd_nxt-sndvar->iss, cur_stream->rcvvar->last_ack_seq-sndvar->iss,
+				  payloadlen, cur_stream->rcvvar->snd_wl2-sndvar->iss, sndvar->peer_wnd / sndvar->mss,
+				  right_wnd_edge - sndvar->iss);
+		}
+#endif
 		cur_stream->rcvvar->dup_acks = 0;
 		cur_stream->rcvvar->last_ack_seq = ack_seq;
 	}
-
+#if USE_CCP
+	if(cur_stream->wait_for_acks) {
+		TRACE_DBG("got ack, but waiting to send... ack=%u, snd_next=%u cwnd=%u\n",
+			  ack_seq-sndvar->iss, cur_stream->snd_nxt-sndvar->iss,
+			  sndvar->cwnd / sndvar->mss);
+	}
+#endif
 	/* Fast retransmission */
 	if (dup && cur_stream->rcvvar->dup_acks == 3) {
 		TRACE_LOSS("Triple duplicated ACKs!! ack_seq: %u\n", ack_seq);
+		TRACE_CCP("tridup ack %u (%u)!\n", ack_seq - cur_stream->sndvar->iss, ack_seq);
 		if (TCP_SEQ_LT(ack_seq, cur_stream->snd_nxt)) {
-			TRACE_LOSS("Reducing snd_nxt from %u to %u\n", 
-					cur_stream->snd_nxt, ack_seq);
+			TRACE_LOSS("Reducing snd_nxt from %u to %u\n",
+                                        cur_stream->snd_nxt-sndvar->iss,
+                                        ack_seq - cur_stream->sndvar->iss);
+
 #if RTM_STAT
 			sndvar->rstat.tdp_ack_cnt++;
 			sndvar->rstat.tdp_ack_bytes += (cur_stream->snd_nxt - ack_seq);
+#endif
+
+#if USE_CCP
+			ccp_record_event(mtcp, cur_stream, EVENT_TRI_DUPACK, ack_seq);
 #endif
 			if (ack_seq != sndvar->snd_una) {
 				TRACE_DBG("ack_seq and snd_una mismatch on tdp ack. "
 						"ack_seq: %u, snd_una: %u\n", 
 						ack_seq, sndvar->snd_una);
 			}
+#if USE_CCP
+			sndvar->missing_seq = ack_seq;
+#else
 			cur_stream->snd_nxt = ack_seq;
+#endif
 		}
 
 		/* update congestion control variables */
@@ -413,8 +449,10 @@ ProcessACK(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_ts,
 			sndvar->ssthresh = 2 * sndvar->mss;
 		}
 		sndvar->cwnd = sndvar->ssthresh + 3 * sndvar->mss;
-		TRACE_CONG("Fast retransmission. cwnd: %u, ssthresh: %u\n", 
-				sndvar->cwnd, sndvar->ssthresh);
+
+		TRACE_CONG("fast retrans: cwnd = ssthresh(%u)+3*mss = %u\n",
+                                sndvar->ssthresh / sndvar->mss,
+                                sndvar->cwnd / sndvar->mss);
 
 		/* count number of retransmissions */
 		if (sndvar->nrtx < TCP_MAX_RTX) {
@@ -440,19 +478,52 @@ ProcessACK(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_ts,
 #endif /* TCP_OPT_SACK_ENABLED */
 
 #if RECOVERY_AFTER_LOSS
+#if USE_CCP
 	/* updating snd_nxt (when recovered from loss) */
-	if (TCP_SEQ_GT(ack_seq, cur_stream->snd_nxt)) {
+	if (TCP_SEQ_GT(ack_seq, cur_stream->snd_nxt) ||
+	    (cur_stream->wait_for_acks && TCP_SEQ_GT(ack_seq, cur_stream->seq_at_last_loss)
+#if TCP_OPT_SACK_ENABLED 
+		&& cur_stream->rcvvar->sacked_pkts == 0
+#endif
+	))
+#else
+        if (TCP_SEQ_GT(ack_seq, cur_stream->snd_nxt))
+#endif /* USE_CCP */
+	{
 #if RTM_STAT
 		sndvar->rstat.ack_upd_cnt++;
 		sndvar->rstat.ack_upd_bytes += (ack_seq - cur_stream->snd_nxt);
 #endif
-		TRACE_LOSS("Updating snd_nxt from %u to %u\n", 
-				cur_stream->snd_nxt, ack_seq);
+		// fast retransmission exit: cwnd=ssthresh
+		cur_stream->sndvar->cwnd = cur_stream->sndvar->ssthresh;
+
+		TRACE_LOSS("Updating snd_nxt from %u to %u\n", cur_stream->snd_nxt, ack_seq);
+#if USE_CCP
+		cur_stream->wait_for_acks = FALSE;
+#endif
 		cur_stream->snd_nxt = ack_seq;
+		TRACE_DBG("Sending again..., ack_seq=%u sndlen=%u cwnd=%u\n",
+                        ack_seq-sndvar->iss,
+                        sndvar->sndbuf->len,
+                        sndvar->cwnd / sndvar->mss);
 		if (sndvar->sndbuf->len == 0) {
 			RemoveFromSendList(mtcp, cur_stream);
+		} else {
+			AddtoSendList(mtcp, cur_stream);
 		}
 	}
+#endif /* RECOVERY_AFTER_LOSS */
+
+	rmlen = ack_seq - sndvar->sndbuf->head_seq;
+	uint16_t packets = rmlen / sndvar->eff_mss;
+	if (packets * sndvar->eff_mss > rmlen) {
+		packets++;
+	}
+
+#if USE_CCP
+	ccp_cong_control(mtcp, cur_stream, ack_seq, rmlen, packets);
+#else
+	// log_cwnd_rtt(cur_stream);
 #endif
 
 	/* If ack_seq is previously acked, return */
@@ -461,16 +532,8 @@ ProcessACK(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_ts,
 	}
 
 	/* Remove acked sequence from send buffer */
-	rmlen = ack_seq - sndvar->sndbuf->head_seq;
 	if (rmlen > 0) {
 		/* Routine goes here only if there is new payload (not retransmitted) */
-		uint16_t packets;
-
-		/* If acks new data */
-		packets = rmlen / sndvar->eff_mss;
-		if ((rmlen / sndvar->eff_mss) * sndvar->eff_mss > rmlen) {
-			packets++;
-		}
 		
 		/* Estimate RTT and calculate rto */
 		if (cur_stream->saw_timestamp) {
@@ -483,6 +546,7 @@ ProcessACK(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_ts,
 			TRACE_RTT("NOT IMPLEMENTED.\n");
 		}
 
+		// TODO CCP should comment this out? 
 		/* Update congestion control variables */
 		if (cur_stream->state >= TCP_ST_ESTABLISHED) {
 			if (sndvar->cwnd < sndvar->ssthresh) {
@@ -687,8 +751,9 @@ Handle_TCP_ST_LISTEN (mtcp_manager_t mtcp, uint32_t cur_ts,
 		tcp_stream* cur_stream, struct tcphdr* tcph) {
 	
 	if (tcph->syn) {
+		if (cur_stream->state == TCP_ST_LISTEN)
+			cur_stream->rcv_nxt++;
 		cur_stream->state = TCP_ST_SYN_RCVD;
-		cur_stream->rcv_nxt++;
 		TRACE_STATE("Stream %d: TCP_ST_SYN_RCVD\n", cur_stream->id);
 		AddtoControlList(mtcp, cur_stream, cur_ts);
 	} else {
@@ -756,6 +821,7 @@ Handle_TCP_ST_SYN_SENT (mtcp_manager_t mtcp, uint32_t cur_ts,
 						NULL, 0, cur_ts, 0);
 				cur_stream->close_reason = TCP_ACTIVE_CLOSE;
 				DestroyTCPStream(mtcp, cur_stream);
+				return;
 			}
 			AddtoControlList(mtcp, cur_stream, cur_ts);
 			if (CONFIG.tcp_timeout > 0)
@@ -794,7 +860,8 @@ Handle_TCP_ST_SYN_RCVD (mtcp_manager_t mtcp, uint32_t cur_ts,
 		cur_stream->snd_nxt = ack_seq;
 		prior_cwnd = sndvar->cwnd;
 		sndvar->cwnd = ((prior_cwnd == 1)? 
-				(sndvar->mss * 2): sndvar->mss);
+				(sndvar->mss * TCP_INIT_CWND): sndvar->mss);
+		TRACE_DBG("sync_recvd: updating cwnd from %u to %u\n", prior_cwnd, sndvar->cwnd);
 		
 		//UpdateRetransmissionTimer(mtcp, cur_stream, cur_ts);
 		sndvar->nrtx = 0;
@@ -805,7 +872,8 @@ Handle_TCP_ST_SYN_RCVD (mtcp_manager_t mtcp, uint32_t cur_ts,
 		TRACE_STATE("Stream %d: TCP_ST_ESTABLISHED\n", cur_stream->id);
 
 		/* update listening socket */
-		listener = mtcp->listener;
+		listener = (struct tcp_listener *)ListenerHTSearch(mtcp->listeners, &tcph->dest);
+
 		ret = StreamEnqueue(listener->acceptq, cur_stream);
 		if (ret < 0) {
 			TRACE_ERROR("Stream %d: Failed to enqueue to "
@@ -1038,7 +1106,7 @@ static inline void
 Handle_TCP_ST_FIN_WAIT_2 (mtcp_manager_t mtcp, uint32_t cur_ts,
 		tcp_stream* cur_stream, struct tcphdr* tcph, uint32_t seq, uint32_t ack_seq,
 		uint8_t *payload, int payloadlen, uint16_t window)
-{	
+{
 	if (tcph->ack) {
 		if (cur_stream->sndvar->sndbuf) {
 			ProcessACK(mtcp, cur_stream, cur_ts, 
@@ -1135,7 +1203,7 @@ Handle_TCP_ST_CLOSING (mtcp_manager_t mtcp, uint32_t cur_ts,
 /*----------------------------------------------------------------------------*/
 int
 ProcessTCPPacket(mtcp_manager_t mtcp, 
-		uint32_t cur_ts, const struct iphdr *iph, int ip_len)
+		 uint32_t cur_ts, const int ifidx, const struct iphdr *iph, int ip_len)
 {
 	struct tcphdr* tcph = (struct tcphdr *) ((u_char *)iph + (iph->ihl << 2));
 	uint8_t *payload    = (uint8_t *)tcph + (tcph->doff << 2);
@@ -1147,29 +1215,41 @@ ProcessTCPPacket(mtcp_manager_t mtcp,
 	uint16_t window = ntohs(tcph->window);
 	uint16_t check;
 	int ret;
+	int rc = -1;
 
 	/* Check ip packet invalidation */	
 	if (ip_len < ((iph->ihl + tcph->doff) << 2))
 		return ERROR;
 
 #if VERIFY_RX_CHECKSUM
-	check = TCPCalcChecksum((uint16_t *)tcph, 
-			(tcph->doff << 2) + payloadlen, iph->saddr, iph->daddr);
-	if (check) {
-		tcph->check = 0;
-		TRACE_DBG("Checksum Error: Original: 0x%04x, calculated: 0x%04x\n", 
-				check, TCPCalcChecksum((uint16_t *)tcph, 
-				(tcph->doff << 2) + payloadlen, iph->saddr, iph->daddr));
-		return ERROR;
+#ifndef DISABLE_HWCSUM
+	if (mtcp->iom->dev_ioctl != NULL)
+		rc = mtcp->iom->dev_ioctl(mtcp->ctx, ifidx,
+					  PKT_RX_TCP_CSUM, NULL);
+#endif
+	if (rc == -1) {
+		check = TCPCalcChecksum((uint16_t *)tcph, 
+					(tcph->doff << 2) + payloadlen, iph->saddr, iph->daddr);
+		if (check) {
+			TRACE_DBG("Checksum Error: Original: 0x%04x, calculated: 0x%04x\n", 
+				  tcph->check, TCPCalcChecksum((uint16_t *)tcph, 
+				  (tcph->doff << 2) + payloadlen, iph->saddr, iph->daddr));
+			tcph->check = 0;
+			return ERROR;
+		}
 	}
 #endif
+
+#if defined(NETSTAT) && defined(ENABLELRO)
+	mtcp->nstat.rx_gdptbytes += payloadlen;
+#endif /* NETSTAT */
 
 	s_stream.saddr = iph->daddr;
 	s_stream.sport = tcph->dest;
 	s_stream.daddr = iph->saddr;
 	s_stream.dport = tcph->source;
 
-	if (!(cur_stream = HTSearch(mtcp->tcp_flow_table, &s_stream))) {
+	if (!(cur_stream = StreamHTSearch(mtcp->tcp_flow_table, &s_stream))) {
 		/* not found in flow table */
 		cur_stream = CreateNewFlowHTEntry(mtcp, cur_ts, iph, ip_len, tcph, 
 				seq, ack_seq, payloadlen, window);
@@ -1187,7 +1267,7 @@ ProcessTCPPacket(mtcp_manager_t mtcp,
 #ifdef DBGMSG
 			DumpIPPacket(mtcp, iph, ip_len);
 #endif
-#if DUMP_STREAM
+#ifdef DUMP_STREAM
 			DumpStream(mtcp, cur_stream);
 #endif
 			return TRUE;
@@ -1229,8 +1309,14 @@ ProcessTCPPacket(mtcp_manager_t mtcp,
 		/* SYN retransmit implies our SYN/ACK was lost. Resend */
 		if (tcph->syn && seq == cur_stream->rcvvar->irs)
 			Handle_TCP_ST_LISTEN(mtcp, cur_ts, cur_stream, tcph);
-		else
+		else {
 			Handle_TCP_ST_SYN_RCVD(mtcp, cur_ts, cur_stream, tcph, ack_seq);
+			if (payloadlen > 0 && cur_stream->state == TCP_ST_ESTABLISHED) {
+				Handle_TCP_ST_ESTABLISHED(mtcp, cur_ts, cur_stream, tcph,
+							  seq, ack_seq, payload,
+							  payloadlen, window);
+			}
+		}
 		break;
 
 	case TCP_ST_ESTABLISHED:

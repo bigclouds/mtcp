@@ -8,7 +8,8 @@
 #include "logger.h"
 
 /*----------------------------------------------------------------------------*/
-void flush_log_data(mtcp_manager_t mtcp)
+void
+flush_log_data(mtcp_manager_t mtcp)
 {
 	int ret = 0;
 	if (mtcp->w_buffer) {
@@ -41,8 +42,10 @@ thread_printf(mtcp_manager_t mtcp, FILE* f_idx, const char* _Format, ...)
 	}
 
 	if (!wbuf) {
-		wbuf = DequeueFreeBuffer(mtcp->logger);
-		assert(wbuf);
+		do { // out of free buffers!!
+			wbuf = DequeueFreeBuffer(mtcp->logger);
+			assert(wbuf);
+		} while (!wbuf);
 		wbuf->buff_len = 0;
 		wbuf->tid = mtcp->ctx->cpu;
 		wbuf->fid = f_idx;

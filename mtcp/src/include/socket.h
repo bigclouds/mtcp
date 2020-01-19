@@ -1,5 +1,5 @@
-#ifndef __SOCKET_H_
-#define __SOCKET_H_
+#ifndef SOCKET_H
+#define SOCKET_H
 
 #include "mtcp_api.h"
 #include "mtcp_epoll.h"
@@ -55,7 +55,9 @@ struct tcp_listener
 	
 	pthread_mutex_t accept_lock;
 	pthread_cond_t accept_cond;
+
+	TAILQ_ENTRY(tcp_listener) he_link;	/* hash table entry link */
 };
 /*----------------------------------------------------------------------------*/
 
-#endif /* __SOCKET_H_ */
+#endif /* SOCKET_H */

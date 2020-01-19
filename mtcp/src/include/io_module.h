@@ -1,10 +1,14 @@
-#ifndef __IO_MODULE_H__
-#define __IO_MODULE_H__
+#ifndef IO_MODULE_H
+#define IO_MODULE_H
 /*----------------------------------------------------------------------------*/
 /* for type def'ns */
 #include <stdint.h>
 /* for ps lib funcs */
 #include "ps.h"
+#ifndef DISABLE_DPDK
+/* for dpdk/onvm big ints */
+#include <gmp.h>
+#endif
 /*----------------------------------------------------------------------------*/
 /**
  * Declaration to soothe down the warnings 
@@ -49,6 +53,8 @@ struct mtcp_thread_context;
  *		   destroy_handle() : free up resources allocated during 
  * 				      init_handle(). Normally called during 
  *				      process termination.
+ *
+ *                 dev_ioctl()      : contains submodules for select drivers
  *		   
  */
 typedef struct io_module_func {
@@ -62,26 +68,47 @@ typedef struct io_module_func {
 	int32_t   (*recv_pkts)(struct mtcp_thread_context *ctx, int ifidx);
 	int32_t	  (*select)(struct mtcp_thread_context *ctx);
 	void	  (*destroy_handle)(struct mtcp_thread_context *ctx);
+	int32_t	  (*dev_ioctl)(struct mtcp_thread_context *ctx, int nif, int cmd, void *argp);
 } io_module_func __attribute__((aligned(__WORDSIZE)));
 /*----------------------------------------------------------------------------*/
 /* set I/O module context */
-int SetInterfaceInfo(char *);
+int SetNetEnv(char *port_list, char *port_stat_list);
+
+/* retrive device-specific endian type */
+int FetchEndianType();
 /*----------------------------------------------------------------------------*/
 /* ptr to the `running' I/O module context */
 extern io_module_func *current_iomodule_func;
+
+/* dev_ioctl related macros */
+#define PKT_TX_IP_CSUM          0x01
+#define PKT_TX_TCP_CSUM         0x02
+#define PKT_RX_TCP_LROSEG	0x03
+#define PKT_TX_TCPIP_CSUM	0x04
+#define PKT_RX_IP_CSUM		0x05
+#define PKT_RX_TCP_CSUM		0x06
+#define PKT_TX_TCPIP_CSUM_PEEK	0x07
+#define DRV_NAME		0x08
 
 /* registered psio context */
 #ifdef DISABLE_PSIO
 #define ps_list_devices(x) 		0
 #endif
 extern io_module_func ps_module_func;
-struct ps_device devices[MAX_DEVICES];
+extern struct ps_device devices[MAX_DEVICES];
 
 /* registered dpdk context */
 extern io_module_func dpdk_module_func;
 
 /* registered netmap context */
 extern io_module_func netmap_module_func;
+
+/* registered onvm context */
+extern io_module_func onvm_module_func;
+
+/* check I/O module access permissions */
+int
+CheckIOModuleAccessPermissions();
 
 /* Macro to assign IO module */
 #define AssignIOModule(m) {						\
@@ -91,8 +118,10 @@ extern io_module_func netmap_module_func;
 			current_iomodule_func = &dpdk_module_func;	\
 		else if (!strcmp(m, "netmap"))				\
 			current_iomodule_func = &netmap_module_func;	\
+ 		else if (!strcmp(m, "onvm"))				\
+  			current_iomodule_func = &onvm_module_func;	\
 		else							\
 			assert(0);					\
 	}
 /*----------------------------------------------------------------------------*/
-#endif /* !__IO_MODULE_H__ */
+#endif /* IO_MODULE_H */

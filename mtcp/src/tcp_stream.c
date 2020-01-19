@@ -8,6 +8,12 @@
 #include "ip_out.h"
 #include "timer.h"
 #include "debug.h"
+#if RATE_LIMIT_ENABLED || PACING_ENABLED
+#include "pacing.h"
+#endif
+#if USE_CCP
+#include "ccp.h"
+#endif
 
 #define TCP_MAX_SEQ 4294967295
 
@@ -38,7 +44,7 @@ char *close_reason_str[] = {
 };
 /*---------------------------------------------------------------------------*/
 /* for rand_r() functions */
-static __thread unsigned int next_seed = 1;
+static __thread unsigned int next_seed;
 /*---------------------------------------------------------------------------*/
 inline char *
 TCPStateToString(const tcp_stream *stream)
@@ -46,9 +52,16 @@ TCPStateToString(const tcp_stream *stream)
 	return state_str[stream->state];
 }
 /*---------------------------------------------------------------------------*/
-unsigned int
-HashFlow(const tcp_stream *flow)
+inline void
+InitializeTCPStreamManager()
 {
+	next_seed = time(NULL);
+}
+/*---------------------------------------------------------------------------*/
+unsigned int
+HashFlow(const void *f)
+{
+	tcp_stream *flow = (tcp_stream *)f;
 #if 0
 	unsigned long hash = 5381;
 	int c;
@@ -64,7 +77,7 @@ HashFlow(const tcp_stream *flow)
 		hash = ((hash << 5) + hash) + c;
 	}
 
-	return hash & (NUM_BINS - 1);
+	return hash & (NUM_BINS_FLOWS - 1);
 #else
 	unsigned int hash, i;
 	char *key = (char *)&flow->saddr;
@@ -78,19 +91,36 @@ HashFlow(const tcp_stream *flow)
 	hash ^= (hash >> 11);
 	hash += (hash << 15);
 
-	return hash & (NUM_BINS - 1);
+	return hash & (NUM_BINS_FLOWS - 1);
 #endif
 }
 /*---------------------------------------------------------------------------*/
 int
-EqualFlow(const tcp_stream *flow1, const tcp_stream *flow2)
+EqualFlow(const void *f1, const void *f2)
 {
+	tcp_stream *flow1 = (tcp_stream *)f1;
+	tcp_stream *flow2 = (tcp_stream *)f2;
+
 	return (flow1->saddr == flow2->saddr && 
 			flow1->sport == flow2->sport &&
 			flow1->daddr == flow2->daddr &&
 			flow1->dport == flow2->dport);
 }
+
+#if USE_CCP
 /*---------------------------------------------------------------------------*/
+unsigned int HashSID(const void *f) {
+	tcp_stream *flow = (tcp_stream *)f;
+	return (flow->id % (NUM_BINS_FLOWS -1));
+}
+
+int
+EqualSID(const void *f1, const void *f2) {
+	return (((tcp_stream *)f1)->id == ((tcp_stream *)f2)->id);
+}
+/*----------------------------------------------------------------------------*/
+#endif
+
 inline void 
 RaiseReadEvent(mtcp_manager_t mtcp, tcp_stream *stream)
 {
@@ -197,6 +227,7 @@ CreateTCPStream(mtcp_manager_t mtcp, socket_map_t socket, int type,
 	tcp_stream *stream = NULL;
 	int ret;
 
+	uint8_t is_external;
 	uint8_t *sa;
 	uint8_t *da;
 	
@@ -234,7 +265,7 @@ CreateTCPStream(mtcp_manager_t mtcp, socket_map_t socket, int type,
 	stream->daddr = daddr;
 	stream->dport = dport;
 
-	ret = HTInsert(mtcp->tcp_flow_table, stream);
+	ret = StreamHTInsert(mtcp->tcp_flow_table, stream);
 	if (ret < 0) {
 		TRACE_ERROR("Stream %d: "
 				"Failed to insert the stream into hash table.\n", stream->id);
@@ -242,6 +273,18 @@ CreateTCPStream(mtcp_manager_t mtcp, socket_map_t socket, int type,
 		pthread_mutex_unlock(&mtcp->ctx->flow_pool_lock);
 		return NULL;
 	}
+
+#if USE_CCP
+	ret = StreamHTInsert(mtcp->tcp_sid_table, stream);
+	if (ret < 0) {
+		TRACE_ERROR("Stream %d: "
+				"Failed to insert the stream into SID lookup table.\n", stream->id);
+		MPFreeChunk(mtcp->flow_pool, stream);
+		pthread_mutex_unlock(&mtcp->ctx->flow_pool_lock);
+		return NULL;
+	}
+#endif
+
 	stream->on_hash_table = TRUE;
 	mtcp->flow_cnt++;
 
@@ -261,7 +304,8 @@ CreateTCPStream(mtcp_manager_t mtcp, socket_map_t socket, int type,
 	stream->sndvar->mss = TCP_DEFAULT_MSS;
 	stream->sndvar->wscale_mine = TCP_DEFAULT_WSCALE;
 	stream->sndvar->wscale_peer = 0;
-	stream->sndvar->nif_out = GetOutputInterface(stream->daddr);
+	stream->sndvar->nif_out = GetOutputInterface(stream->daddr, &is_external);
+	stream->is_external = is_external;
 
 	stream->sndvar->iss = rand_r(&next_seed) % TCP_MAX_SEQ;
 	//stream->sndvar->iss = 0;
@@ -269,6 +313,9 @@ CreateTCPStream(mtcp_manager_t mtcp, socket_map_t socket, int type,
 
 	stream->snd_nxt = stream->sndvar->iss;
 	stream->sndvar->snd_una = stream->sndvar->iss;
+#if USE_CCP
+	stream->sndvar->missing_seq = 0;
+#endif
 	stream->sndvar->snd_wnd = CONFIG.sndbuf_size;
 	stream->rcv_nxt = 0;
 	stream->rcvvar->rcv_wnd = TCP_INITIAL_WINDOW;
@@ -323,6 +370,16 @@ CreateTCPStream(mtcp_manager_t mtcp, socket_map_t socket, int type,
 			sa[0], sa[1], sa[2], sa[3], ntohs(stream->sport), 
 			da[0], da[1], da[2], da[3], ntohs(stream->dport), 
 			stream->sndvar->iss);
+
+#if RATE_LIMIT_ENABLED
+	stream->bucket = NewTokenBucket();
+#endif
+#if PACING_ENABLED
+	stream->pacer = NewPacketPacer();
+#endif
+#if USE_CCP
+	ccp_create(mtcp, stream);
+#endif
 
 	UNUSED(da);
 	UNUSED(sa);
@@ -476,7 +533,7 @@ DestroyTCPStream(mtcp_manager_t mtcp, tcp_stream *stream)
 	pthread_mutex_lock(&mtcp->ctx->flow_pool_lock);
 
 	/* remove from flow hash table */
-	HTRemove(mtcp->tcp_flow_table, stream);
+	StreamHTRemove(mtcp->tcp_flow_table, stream);
 	stream->on_hash_table = FALSE;
 	
 	mtcp->flow_cnt--;
@@ -490,7 +547,16 @@ DestroyTCPStream(mtcp_manager_t mtcp, tcp_stream *stream)
 		if (mtcp->ap) {
 			ret = FreeAddress(mtcp->ap, &addr);
 		} else {
-			ret = FreeAddress(ap, &addr);
+			uint8_t is_external;
+			int nif = GetOutputInterface(addr.sin_addr.s_addr, &is_external);
+			if (nif < 0) {
+				TRACE_ERROR("nif is negative!\n");
+				ret = -1;
+			} else {
+			        int eidx = CONFIG.nif_to_eidx[nif];
+				ret = FreeAddress(ap[eidx], &addr);
+			}
+			UNUSED(is_external);
 		}
 		if (ret < 0) {
 			TRACE_ERROR("(NEVER HAPPEN) Failed to free address.\n");

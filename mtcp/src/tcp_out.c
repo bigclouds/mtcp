@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include "tcp_out.h"
+#include "tcp_util.h"
 #include "mtcp.h"
 #include "ip_out.h"
 #include "tcp_in.h"
@@ -7,15 +8,15 @@
 #include "eventpoll.h"
 #include "timer.h"
 #include "debug.h"
+#if RATE_LIMIT_ENABLED || PACING_ENABLED
+#include "pacing.h"
+#endif
 
 #define TCP_CALCULATE_CHECKSUM      TRUE
 #define ACK_PIGGYBACK				TRUE
 #define TRY_SEND_BEFORE_QUEUE		FALSE
 
 #define TCP_MAX_WINDOW 65535
-
-#define MAX(a, b) ((a)>(b)?(a):(b))
-#define MIN(a, b) ((a)<(b)?(a):(b))
 
 /*----------------------------------------------------------------------------*/
 static inline uint16_t
@@ -124,7 +125,7 @@ GenerateTCPOptions(tcp_stream *cur_stream, uint32_t cur_ts,
 
 #if TCP_OPT_SACK_ENABLED
 		if (flags & TCP_OPT_SACK) {
-			// TODO: implement SACK support
+			// i += GenerateSACKOption(cur_stream, tcpopt + i);
 		}
 #endif
 	}
@@ -143,9 +144,10 @@ SendTCPPacketStandalone(struct mtcp_manager *mtcp,
 	uint8_t *tcpopt;
 	uint32_t *ts;
 	uint16_t optlen;
+	int rc = -1;
 
 	optlen = CalculateOptionLength(flags);
-	if (payloadlen > TCP_DEFAULT_MSS + optlen) {
+	if (payloadlen + optlen > TCP_DEFAULT_MSS) {
 		TRACE_ERROR("Payload size exceeds MSS.\n");
 		assert(0);
 		return ERROR;
@@ -192,11 +194,23 @@ SendTCPPacketStandalone(struct mtcp_manager *mtcp,
 	// copy payload if exist
 	if (payloadlen > 0) {
 		memcpy((uint8_t *)tcph + TCP_HEADER_LEN + optlen, payload, payloadlen);
+#if defined(NETSTAT) && defined(ENABLELRO)
+		mtcp->nstat.tx_gdptbytes += payloadlen;
+#endif /* NETSTAT */
 	}
-
+		
 #if TCP_CALCULATE_CHECKSUM
-	tcph->check = TCPCalcChecksum((uint16_t *)tcph, 
-			TCP_HEADER_LEN + optlen + payloadlen, saddr, daddr);
+#ifndef DISABLE_HWCSUM
+	uint8_t is_external;
+	if (mtcp->iom->dev_ioctl != NULL)
+		rc = mtcp->iom->dev_ioctl(mtcp->ctx, GetOutputInterface(daddr, &is_external),
+					  PKT_TX_TCPIP_CSUM, NULL);
+	UNUSED(is_external);
+#endif
+	if (rc == -1)
+		tcph->check = TCPCalcChecksum((uint16_t *)tcph, 
+					      TCP_HEADER_LEN + optlen + payloadlen,
+					      saddr, daddr);
 #endif
 
 	if (tcph->syn || tcph->fin) {
@@ -214,9 +228,10 @@ SendTCPPacket(struct mtcp_manager *mtcp, tcp_stream *cur_stream,
 	uint16_t optlen;
 	uint8_t wscale = 0;
 	uint32_t window32 = 0;
+	int rc = -1;
 
 	optlen = CalculateOptionLength(flags);
-	if (payloadlen > cur_stream->sndvar->mss + optlen) {
+	if (payloadlen + optlen > cur_stream->sndvar->mss) {
 		TRACE_ERROR("Payload size exceeds MSS\n");
 		return ERROR;
 	}
@@ -287,7 +302,7 @@ SendTCPPacket(struct mtcp_manager *mtcp, tcp_stream *cur_stream,
 	}
 
 	window32 = cur_stream->rcvvar->rcv_wnd >> wscale;
-	tcph->window = htons(MIN((uint16_t)window32, TCP_MAX_WINDOW));
+	tcph->window = htons((uint16_t)MIN(window32, TCP_MAX_WINDOW));
 	/* if the advertised window is 0, we need to advertise again later */
 	if (window32 == 0) {
 		cur_stream->need_wnd_adv = TRUE;
@@ -300,14 +315,23 @@ SendTCPPacket(struct mtcp_manager *mtcp, tcp_stream *cur_stream,
 	// copy payload if exist
 	if (payloadlen > 0) {
 		memcpy((uint8_t *)tcph + TCP_HEADER_LEN + optlen, payload, payloadlen);
+#if defined(NETSTAT) && defined(ENABLELRO)
+		mtcp->nstat.tx_gdptbytes += payloadlen;
+#endif /* NETSTAT */
 	}
 
 #if TCP_CALCULATE_CHECKSUM
-	tcph->check = TCPCalcChecksum((uint16_t *)tcph, 
-			TCP_HEADER_LEN + optlen + payloadlen, 
-			cur_stream->saddr, cur_stream->daddr);
+#ifndef DISABLE_HWCSUM
+	if (mtcp->iom->dev_ioctl != NULL)
+		rc = mtcp->iom->dev_ioctl(mtcp->ctx, cur_stream->sndvar->nif_out,
+					  PKT_TX_TCPIP_CSUM, NULL);
 #endif
-
+	if (rc == -1)
+		tcph->check = TCPCalcChecksum((uint16_t *)tcph, 
+					      TCP_HEADER_LEN + optlen + payloadlen, 
+					      cur_stream->saddr, cur_stream->daddr);
+#endif
+	
 	cur_stream->snd_nxt += payloadlen;
 
 	if (tcph->syn || tcph->fin) {
@@ -328,13 +352,14 @@ SendTCPPacket(struct mtcp_manager *mtcp, tcp_stream *cur_stream,
 				cur_ts, cur_stream->sndvar->rto, cur_stream->sndvar->ts_rto);
 		AddtoRTOList(mtcp, cur_stream);
 	}
-
+		
 	return payloadlen;
 }
 /*----------------------------------------------------------------------------*/
 static int
 FlushTCPSendingBuffer(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_ts)
 {
+#if 0
 	struct tcp_send_vars *sndvar = cur_stream->sndvar;
 	const uint32_t maxlen = sndvar->mss - CalculateOptionLength(TCP_FLAG_ACK);
 	uint8_t *data;
@@ -344,6 +369,7 @@ FlushTCPSendingBuffer(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_
 	int16_t sndlen;
 	uint32_t window;
 	int packets = 0;
+	uint8_t wack_sent = 0;
 
 	if (!sndvar->sndbuf) {
 		TRACE_ERROR("Stream %d: No send buffer available.\n", cur_stream->id);
@@ -389,6 +415,9 @@ FlushTCPSendingBuffer(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_
 			len = buffered_len;
 		}
 		
+		if (len > window)
+			len = window;
+
 		if (len <= 0)
 			break;
 
@@ -405,9 +434,11 @@ FlushTCPSendingBuffer(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_
 						"peer_wnd: %u, (snd_nxt-snd_una): %u\n", 
 						sndvar->peer_wnd, seq - sndvar->snd_una);
 #endif
-				if (TS_TO_MSEC(cur_ts - sndvar->ts_lastack_sent) > 500) {
+				if (!wack_sent && TS_TO_MSEC(cur_ts - sndvar->ts_lastack_sent) > 500) {
 					EnqueueACK(mtcp, cur_stream, cur_ts, ACK_OPT_WACK);
 				}
+				else
+					wack_sent = 1;
 			}
 			packets = -3;
 			goto out;
@@ -420,11 +451,161 @@ FlushTCPSendingBuffer(mtcp_manager_t mtcp, tcp_stream *cur_stream, uint32_t cur_
 			goto out;
 		}
 		packets++;
+
+		window -= len;
 	}
 
  out:
 	SBUF_UNLOCK(&sndvar->write_lock);
 	return packets;
+#else
+	struct tcp_send_vars *sndvar = cur_stream->sndvar;
+	uint8_t *data;
+	uint32_t pkt_len;
+	uint32_t len;
+	uint32_t seq = 0;
+	int remaining_window;
+	int sndlen;
+	int packets = 0;
+	uint8_t wack_sent = 0;
+	
+	if (!sndvar->sndbuf) {
+		TRACE_ERROR("Stream %d: No send buffer available.\n", cur_stream->id);
+		assert(0);
+		return 0;
+	}
+	
+	SBUF_LOCK(&sndvar->write_lock);
+
+	if (sndvar->sndbuf->len == 0) {
+		packets = 0;
+		goto out;
+	}
+	
+	while (1) {
+#if USE_CCP
+		if (sndvar->missing_seq) {
+			seq = sndvar->missing_seq;
+		} else {
+#endif
+			seq = cur_stream->snd_nxt;
+#if USE_CCP
+		}
+#endif
+		//seq = cur_stream->snd_nxt;
+		data = sndvar->sndbuf->head + (seq - sndvar->sndbuf->head_seq);
+		len = sndvar->sndbuf->len - (seq - sndvar->sndbuf->head_seq);
+#if USE_CCP
+		// Without this, mm continually drops packets (not sure why, bursting?) -> mtcp sees lots of losses -> throughput dies
+		if(cur_stream->wait_for_acks &&
+		   TCP_SEQ_GT(cur_stream->snd_nxt, cur_stream->rcvvar->last_ack_seq)) {
+			goto out;
+		}
+#endif
+		/* sanity check */
+		if (TCP_SEQ_LT(seq, sndvar->sndbuf->head_seq)) {
+			TRACE_ERROR("Stream %d: Invalid sequence to send. "
+						"state: %s, seq: %u, head_seq: %u.\n",
+						cur_stream->id, TCPStateToString(cur_stream),
+						seq, sndvar->sndbuf->head_seq);
+			assert(0);
+			break;
+		}
+		if (TCP_SEQ_LT(seq, sndvar->snd_una)) {
+			TRACE_ERROR("Stream %d: Invalid sequence to send. "
+						"state: %s, seq: %u, snd_una: %u.\n",
+						cur_stream->id, TCPStateToString(cur_stream),
+						seq, sndvar->snd_una);
+			assert(0);
+			break;
+		}
+		if (sndvar->sndbuf->len < (seq - sndvar->sndbuf->head_seq)) {
+			TRACE_ERROR("Stream %d: len < 0\n",
+						cur_stream->id);
+			assert(0);
+			break;
+		}
+
+		/* if there is no buffered data */
+		if (len == 0)
+			break;
+
+#if TCP_OPT_SACK_ENABLED
+		if (SeqIsSacked(cur_stream, seq)) {
+			TRACE_DBG("!! SKIPPING %u\n", seq - sndvar->iss);
+			cur_stream->snd_nxt += len;
+			continue;
+		}
+#endif
+
+		remaining_window = MIN(sndvar->cwnd, sndvar->peer_wnd)
+			               - (seq - sndvar->snd_una);
+		/* if there is no space in the window */
+		if (remaining_window <= 0 ||
+		    (remaining_window < sndvar->mss && seq - sndvar->snd_una > 0)) {
+			/* if peer window is full, send ACK and let its peer advertises new one */
+			if (sndvar->peer_wnd <= sndvar->cwnd) {
+#if 0
+				TRACE_CLWND("Full peer window. "
+							"peer_wnd: %u, (snd_nxt-snd_una): %u\n",
+							sndvar->peer_wnd, seq - sndvar->snd_una);
+#endif
+				if (!wack_sent && TS_TO_MSEC(cur_ts - sndvar->ts_lastack_sent) > 500)
+					EnqueueACK(mtcp, cur_stream, cur_ts, ACK_OPT_WACK);
+				else
+					wack_sent = 1;
+			}
+			packets = -3;
+			goto out;
+		}
+		
+		/* payload size limited by remaining window space */
+		len = MIN(len, remaining_window);
+		/* payload size limited by TCP MSS */
+		pkt_len = MIN(len, sndvar->mss - CalculateOptionLength(TCP_FLAG_ACK));
+
+#if RATE_LIMIT_ENABLED
+		// update rate
+		if (cur_stream->rcvvar->srtt) {
+			cur_stream->bucket->rate = 
+                (uint32_t)(
+                    SECONDS_TO_USECS(                                                      // bits / s = mbps
+                        BYTES_TO_BITS(                                                     // bits / us 
+                            (double)sndvar->cwnd / UNSHIFT_SRTT(cur_stream->rcvvar->srtt)  // bytes / us
+                        )
+                    )
+                );
+		}
+		if (cur_stream->bucket->rate != 0 && (SufficientTokens(cur_stream->bucket, pkt_len*8) < 0)) {
+			packets = -3;
+			goto out;
+		}
+#endif
+    
+#if PACING_ENABLED
+                if (!CanSendNow(cur_stream->pacer)) {
+                    packets = -3;
+                    goto out;
+                }
+#endif
+		if ((sndlen = SendTCPPacket(mtcp, cur_stream, cur_ts,
+					    TCP_FLAG_ACK, data, pkt_len)) < 0) {
+			/* there is no available tx buf */
+			packets = -3;
+			goto out;
+		}
+#if USE_CCP
+		if (sndvar->missing_seq) {
+			sndvar->missing_seq = 0;
+		}
+#endif
+		packets++;
+	}
+
+ out:
+	SBUF_UNLOCK(&sndvar->write_lock);	
+	return packets;	
+#endif
 }
 /*----------------------------------------------------------------------------*/
 static inline int 
@@ -542,13 +723,19 @@ WriteTCPControlList(mtcp_manager_t mtcp,
 			cur_stream->sndvar->on_control_list = FALSE;
 			//TRACE_DBG("Stream %u: Sending control packet\n", cur_stream->id);
 			ret = SendControlPacket(mtcp, cur_stream, cur_ts);
-			if (ret < 0) {
+			if (ret == -2) {
 				TAILQ_INSERT_HEAD(&sender->control_list, 
 						cur_stream, sndvar->control_link);
 				cur_stream->sndvar->on_control_list = TRUE;
 				sender->control_list_cnt++;
 				/* since there is no available write buffer, break */
 				break;
+			} else if (ret < 0) {
+				/* try again after handling other streams */
+				TAILQ_INSERT_TAIL(&sender->control_list,
+						  cur_stream, sndvar->control_link);
+				cur_stream->sndvar->on_control_list = TRUE;
+				sender->control_list_cnt++;
 			}
 		} else {
 			TRACE_ERROR("Stream %d: not on control list.\n", cur_stream->id);
@@ -769,14 +956,15 @@ GetSender(mtcp_manager_t mtcp, tcp_stream *cur_stream)
 {
 	if (cur_stream->sndvar->nif_out < 0) {
 		return mtcp->g_sender;
+	}
 
-	} else if (cur_stream->sndvar->nif_out >= CONFIG.eths_num) {
+	int eidx = CONFIG.nif_to_eidx[cur_stream->sndvar->nif_out];
+	if (eidx < 0 || eidx >= CONFIG.eths_num) {
 		TRACE_ERROR("(NEVER HAPPEN) Failed to find appropriate sender.\n");
 		return NULL;
-
-	} else {
-		return mtcp->n_sender[cur_stream->sndvar->nif_out];
 	}
+
+	return mtcp->n_sender[eidx];
 }
 /*----------------------------------------------------------------------------*/
 inline void 

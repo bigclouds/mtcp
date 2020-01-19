@@ -1,5 +1,5 @@
-#ifndef __TCP_IN_H_
-#define __TCP_IN_H_
+#ifndef TCP_IN_H
+#define TCP_IN_H
 
 #include <linux/if_ether.h>
 #include <linux/tcp.h>
@@ -9,12 +9,15 @@
 #include "mtcp.h"
 #include "fhash.h"
 
+#ifndef TCP_FLAGS
+#define TCP_FLAGS
 #define TCP_FLAG_FIN	0x01	// 0000 0001
 #define TCP_FLAG_SYN	0x02	// 0000 0010
 #define TCP_FLAG_RST	0x04	// 0000 0100
 #define TCP_FLAG_PSH	0x08	// 0000 1000
 #define TCP_FLAG_ACK	0x10	// 0001 0000
 #define TCP_FLAG_URG	0x20	// 0010 0000
+#endif
 #define TCP_FLAG_SACK	0x40	// 0100 0000
 #define TCP_FLAG_WACK	0x80	// 1000 0000
 
@@ -67,6 +70,8 @@
 #define TCP_MAX_SYN_RETRY		7
 #define TCP_MAX_BACKOFF			7
 
+#define TCP_INIT_CWND                   2
+
 enum tcp_state
 {
 	TCP_ST_CLOSED		= 0, 
@@ -110,15 +115,15 @@ void
 ParseTCPOptions(tcp_stream *cur_stream, 
 		uint32_t cur_ts, uint8_t *tcpopt, int len);
 
-inline int 
+extern inline int 
 ProcessTCPUplink(mtcp_manager_t mtcp, uint32_t cur_ts, tcp_stream *cur_stream, 
 		const struct tcphdr *tcph, uint32_t seq, uint32_t ack_seq, 
 		uint8_t *payload, int payloadlen, uint32_t window);
 
 int
-ProcessTCPPacket(struct mtcp_manager *mtcp, uint32_t cur_ts, 
+ProcessTCPPacket(struct mtcp_manager *mtcp, uint32_t cur_ts, const int ifidx,
 					const struct iphdr* iph, int ip_len);
 uint16_t 
 TCPCalcChecksum(uint16_t *buf, uint16_t len, uint32_t saddr, uint32_t daddr);
 
-#endif /* __TCP_IN_H_ */
+#endif /* TCP_IN_H */

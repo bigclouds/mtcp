@@ -1,5 +1,9 @@
 #include <stdint.h>
 #include <sys/types.h>
+/* for inet_ntoa() */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "mtcp.h"
 #include "arp.h"
@@ -55,7 +59,7 @@ struct arp_manager
 struct arp_manager g_arpm;
 /*----------------------------------------------------------------------------*/
 void 
-DumpARPPacket(struct arphdr *arph);
+DumpARPPacket(mtcp_manager_t mtcp, struct arphdr *arph);
 /*----------------------------------------------------------------------------*/
 int 
 InitARPTable()
@@ -91,31 +95,35 @@ GetHWaddr(uint32_t ip)
 }
 /*----------------------------------------------------------------------------*/
 unsigned char *
-GetDestinationHWaddr(uint32_t dip)
+GetDestinationHWaddr(uint32_t dip, uint8_t is_gateway)
 {
 	unsigned char *d_haddr = NULL;
 	int prefix = 0;
 	int i;
 
-	/* Longest prefix matching */
-	for (i = 0; i < CONFIG.arp.entries; i++) {
-		if (CONFIG.arp.entry[i].prefix == 1) {
-			if (CONFIG.arp.entry[i].ip == dip) {
-				d_haddr = CONFIG.arp.entry[i].haddr;
-				break;
-			}	
-		} else {
-			if ((dip & CONFIG.arp.entry[i].ip_mask) ==
-					CONFIG.arp.entry[i].ip_masked) {
-				
-				if (CONFIG.arp.entry[i].prefix > prefix) {
+	if (is_gateway == 1 && CONFIG.arp.gateway)
+		d_haddr = (CONFIG.arp.gateway)->haddr;
+	else {	
+		/* Longest prefix matching */
+		for (i = 0; i < CONFIG.arp.entries; i++) {
+			if (CONFIG.arp.entry[i].prefix == 1) {
+				if (CONFIG.arp.entry[i].ip == dip) {
 					d_haddr = CONFIG.arp.entry[i].haddr;
-					prefix = CONFIG.arp.entry[i].prefix;
+					break;
+				}	
+			} else {
+				if ((dip & CONFIG.arp.entry[i].ip_mask) ==
+				    CONFIG.arp.entry[i].ip_masked) {
+					
+					if (CONFIG.arp.entry[i].prefix > prefix) {
+						d_haddr = CONFIG.arp.entry[i].haddr;
+						prefix = CONFIG.arp.entry[i].prefix;
+					}
 				}
 			}
 		}
 	}
-
+	
 	return d_haddr;
 }
 /*----------------------------------------------------------------------------*/
@@ -140,10 +148,11 @@ ARPOutput(struct mtcp_manager *mtcp, int nif, int opcode,
 	arph->ar_op = htons(opcode);
 
 	/* Fill arp body */
-	arph->ar_sip = CONFIG.eths[nif].ip_addr;
+	int edix = CONFIG.nif_to_eidx[nif];
+	arph->ar_sip = CONFIG.eths[edix].ip_addr;
 	arph->ar_tip = dst_ip;
 
-	memcpy(arph->ar_sha, CONFIG.eths[nif].haddr, arph->ar_hln);
+	memcpy(arph->ar_sha, CONFIG.eths[edix].haddr, arph->ar_hln);
 	if (target_haddr) {
 		memcpy(arph->ar_tha, target_haddr, arph->ar_hln);
 	} else {
@@ -152,7 +161,7 @@ ARPOutput(struct mtcp_manager *mtcp, int nif, int opcode,
 	memset(arph->pad, 0, ARP_PAD_LEN);
 
 #if DBGMSG
-	DumpARPPacket(arph);
+	DumpARPPacket(mtcp, arph);
 #endif
 
 	return 0;
@@ -169,6 +178,13 @@ RegisterARPEntry(uint32_t ip, const unsigned char *haddr)
 	CONFIG.arp.entry[idx].ip_mask = -1;
 	CONFIG.arp.entry[idx].ip_masked = ip;
 
+	if (CONFIG.gateway && ((CONFIG.gateway)->daddr &
+			       CONFIG.arp.entry[idx].ip_mask) ==
+	    CONFIG.arp.entry[idx].ip_masked) {
+		CONFIG.arp.gateway = &CONFIG.arp.entry[idx];
+		TRACE_CONFIG("ARP Gateway SET!\n");
+	}
+	
 	CONFIG.arp.entries = idx + 1;
 
 	TRACE_CONFIG("Learned new arp entry.\n");
@@ -213,7 +229,7 @@ ProcessARPRequest(mtcp_manager_t mtcp,
 	unsigned char *temp;
 
 	/* register the arp entry if not exist */
-	temp = GetDestinationHWaddr(arph->ar_sip);
+	temp = GetDestinationHWaddr(arph->ar_sip, 0);
 	if (!temp) {
 		RegisterARPEntry(arph->ar_sip, arph->ar_sha);
 	}
@@ -231,7 +247,7 @@ ProcessARPReply(mtcp_manager_t mtcp, struct arphdr *arph, uint32_t cur_ts)
 	struct arp_queue_entry *ent;
 
 	/* register the arp entry if not exist */
-	temp = GetDestinationHWaddr(arph->ar_sip);
+	temp = GetDestinationHWaddr(arph->ar_sip, 0);
 	if (!temp) {
 		RegisterARPEntry(arph->ar_sip, arph->ar_sha);
 	}
@@ -255,7 +271,7 @@ ProcessARPPacket(mtcp_manager_t mtcp, uint32_t cur_ts,
 		                  const int ifidx, unsigned char *pkt_data, int len)
 {
 	struct arphdr *arph = (struct arphdr *)(pkt_data + sizeof(struct ethhdr));
-	int i;
+	int i, nif;
 	int to_me = FALSE;
 	
 	/* process the arp messages destined to me */
@@ -269,12 +285,13 @@ ProcessARPPacket(mtcp_manager_t mtcp, uint32_t cur_ts,
 		return TRUE;
 	
 #if DBGMSG
-	DumpARPPacket(arph);
+	DumpARPPacket(mtcp, arph);
 #endif
 
 	switch (ntohs(arph->ar_op)) {
 		case arp_op_request:
-			ProcessARPRequest(mtcp, arph, ifidx, cur_ts);
+		        nif = CONFIG.eths[ifidx].ifindex; // use the port index as argument
+			ProcessARPRequest(mtcp, arph, nif, cur_ts);
 			break;
 
 		case arp_op_reply:
@@ -294,14 +311,16 @@ ProcessARPPacket(mtcp_manager_t mtcp, uint32_t cur_ts,
 void 
 ARPTimer(mtcp_manager_t mtcp, uint32_t cur_ts)
 {
-	struct arp_queue_entry *ent;
+	struct arp_queue_entry *ent, *ent_tmp;
 
 	/* if the arp requet is timed out, retransmit */
 	pthread_mutex_lock(&g_arpm.lock);
-	TAILQ_FOREACH(ent, &g_arpm.list, arp_link) {
+	TAILQ_FOREACH_SAFE(ent, &g_arpm.list, arp_link, ent_tmp) {
 		if (TCP_SEQ_GT(cur_ts, ent->ts_out + SEC_TO_TS(ARP_TIMEOUT_SEC))) {
-			TRACE_INFO("[CPU%2d] ARP request timed out.\n", 
-					mtcp->ctx->cpu);
+			struct in_addr ina;
+			ina.s_addr = ent->ip;
+			TRACE_INFO("[CPU%2d] ARP request for %s timed out.\n", 
+				   mtcp->ctx->cpu, inet_ntoa(ina));
 			TAILQ_REMOVE(&g_arpm.list, ent, arp_link);
 			free(ent);
 		}
@@ -338,26 +357,26 @@ PrintARPTable()
 }
 /*----------------------------------------------------------------------------*/
 void 
-DumpARPPacket(struct arphdr *arph)
+DumpARPPacket(mtcp_manager_t mtcp, struct arphdr *arph)
 {
 	uint8_t *t;
 
-	fprintf(stderr, "ARP header: \n");
-	fprintf(stderr, "Hardware type: %d (len: %d), "
-			"protocol type: %d (len: %d), opcode: %d\n", 
-			ntohs(arph->ar_hrd), arph->ar_hln, 
-			ntohs(arph->ar_pro), arph->ar_pln, ntohs(arph->ar_op));
+	thread_printf(mtcp, mtcp->log_fp, "ARP header: \n");
+	thread_printf(mtcp, mtcp->log_fp, "Hardware type: %d (len: %d), "
+		      "protocol type: %d (len: %d), opcode: %d\n", 
+		      ntohs(arph->ar_hrd), arph->ar_hln, 
+		      ntohs(arph->ar_pro), arph->ar_pln, ntohs(arph->ar_op));
 	t = (uint8_t *)&arph->ar_sip;
-	fprintf(stderr, "Sender IP: %u.%u.%u.%u, "
-			"haddr: %02X:%02X:%02X:%02X:%02X:%02X\n", 
-			t[0], t[1], t[2], t[3], 
-			arph->ar_sha[0], arph->ar_sha[1], arph->ar_sha[2], 
-			arph->ar_sha[3], arph->ar_sha[4], arph->ar_sha[5]);
+	thread_printf(mtcp, mtcp->log_fp, "Sender IP: %u.%u.%u.%u, "
+		      "haddr: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+		      t[0], t[1], t[2], t[3], 
+		      arph->ar_sha[0], arph->ar_sha[1], arph->ar_sha[2], 
+		      arph->ar_sha[3], arph->ar_sha[4], arph->ar_sha[5]);
 	t = (uint8_t *)&arph->ar_tip;
-	fprintf(stderr, "Target IP: %u.%u.%u.%u, "
-			"haddr: %02X:%02X:%02X:%02X:%02X:%02X\n", 
-			t[0], t[1], t[2], t[3], 
-			arph->ar_tha[0], arph->ar_tha[1], arph->ar_tha[2], 
-			arph->ar_tha[3], arph->ar_tha[4], arph->ar_tha[5]);
+	thread_printf(mtcp, mtcp->log_fp, "Target IP: %u.%u.%u.%u, "
+		      "haddr: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+		      t[0], t[1], t[2], t[3], 
+		      arph->ar_tha[0], arph->ar_tha[1], arph->ar_tha[2], 
+		      arph->ar_tha[3], arph->ar_tha[4], arph->ar_tha[5]);
 }
 /*----------------------------------------------------------------------------*/

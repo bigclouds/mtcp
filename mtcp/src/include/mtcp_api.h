@@ -1,11 +1,17 @@
-#ifndef __MTCP_API_H_
-#define __MTCP_API_H_
+#ifndef MTCP_API_H
+#define MTCP_API_H
 
 #include <stdint.h>
 #include <netinet/in.h>
 #include <sys/uio.h>
 
+#ifndef UNUSED
 #define UNUSED(x)	(void)x
+#endif
+
+#ifndef INPORT_ANY
+#define INPORT_ANY	(uint16_t)0
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,7 +43,7 @@ struct mtcp_conf
 typedef struct mtcp_context *mctx_t;
 
 int 
-mtcp_init(char *config_file);
+mtcp_init(const char *config_file);
 
 void 
 mtcp_destroy();
@@ -105,30 +111,38 @@ mtcp_connect(mctx_t mctx, int sockid,
 int 
 mtcp_close(mctx_t mctx, int sockid);
 
-int 
-mtcp_abort(mctx_t mctx, int sockid);
-
+/** Returns the current address to which the socket sockfd is bound
+ * @param [in] mctx: mtcp context
+ * @param [in] addr: address buffer to be filled
+ * @param [in] addrlen: amount of space pointed to by addr
+ * @return 0 on success, -1 on error
+ */
 int
-mtcp_read(mctx_t mctx, int sockid, char *buf, int len);
+mtcp_getsockname(mctx_t mctx, int sock, struct sockaddr *addr, socklen_t *addrlen);
+	
+int
+mtcp_getpeername(mctx_t mctx, int sockid, struct sockaddr *addr,
+		 socklen_t *addrlen);
+
+inline ssize_t
+mtcp_read(mctx_t mctx, int sockid, char *buf, size_t len);
+
+ssize_t
+mtcp_recv(mctx_t mctx, int sockid, char *buf, size_t len, int flags);
 
 /* readv should work in atomic */
 int
-mtcp_readv(mctx_t mctx, int sockid, struct iovec *iov, int numIOV);
+mtcp_readv(mctx_t mctx, int sockid, const struct iovec *iov, int numIOV);
 
-int
-mtcp_write(mctx_t mctx, int sockid, char *buf, int len);
+ssize_t
+mtcp_write(mctx_t mctx, int sockid, const char *buf, size_t len);
 
 /* writev should work in atomic */
 int
-mtcp_writev(mctx_t mctx, int sockid, struct iovec *iov, int numIOV);
-
-#if 0
-int
-mtcp_delete(mctx_t mctx, int sockid, int len);
-#endif
+mtcp_writev(mctx_t mctx, int sockid, const struct iovec *iov, int numIOV);
 
 #ifdef __cplusplus
 };
 #endif
 
-#endif /* __MTCP_API_H_ */
+#endif /* MTCP_API_H */

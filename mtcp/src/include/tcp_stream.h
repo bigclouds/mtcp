@@ -1,11 +1,14 @@
-#ifndef __TCP_STREAM_H_
-#define __TCP_STREAM_H_
+#ifndef TCP_STREAM_H
+#define TCP_STREAM_H
 
 #include <netinet/ip.h>
 #include <linux/tcp.h>
 #include <sys/queue.h>
 
 #include "mtcp.h"
+#if RATE_LIMIT_ENABLED || PACING_ENABLED
+#include "pacing.h"
+#endif
 
 struct rtm_stat
 {
@@ -60,6 +63,7 @@ struct tcp_recv_vars
 
 #if TCP_OPT_SACK_ENABLED		/* currently not used */
 #define MAX_SACK_ENTRY 8
+	uint32_t sacked_pkts;
 	struct sack_entry sack_table[MAX_SACK_ENTRY];
 	uint8_t sacks:3;
 #endif /* TCP_OPT_SACK_ENABLED */
@@ -109,6 +113,9 @@ struct tcp_send_vars
 	/* congestion control variables */
 	uint32_t cwnd;				/* congestion window */
 	uint32_t ssthresh;			/* slow start threshold */
+#if USE_CCP
+	uint32_t missing_seq;
+#endif
 
 	/* timestamp */
 	uint32_t ts_lastack_sent;	/* last ack sent time */
@@ -181,41 +188,65 @@ typedef struct tcp_stream
 			saw_timestamp:1,	/* whether peer sends timestamp */
 			sack_permit:1,		/* whether peer permits SACK */
 			control_list_waiting:1, 
-			have_reset:1;
+			have_reset:1,
+			is_external:1,		/* the peer node is locate outside of lan */
+			wait_for_acks:1;	/* if true, the sender should wait for acks to catch up before sending again */
 	
 	uint32_t snd_nxt;		/* send next */
 	uint32_t rcv_nxt;		/* receive next */
+#if USE_CCP
+	uint32_t seq_at_last_loss;	/* the sequence number we left off at before we stopped at wait_for_acks (due to loss) */
+#endif
 
 	struct tcp_recv_vars *rcvvar;
 	struct tcp_send_vars *sndvar;
+#if RATE_LIMIT_ENABLED
+	struct token_bucket  *bucket;
+#endif
+#if PACING_ENABLED
+        struct packet_pacer  *pacer;
+#endif
+#if USE_CCP
+    struct ccp_connection *ccp_conn;
+#endif
 	
 	uint32_t last_active_ts;		/* ts_last_ack_sent or ts_last_ts_upd */
 
 } tcp_stream;
 
-inline char *
+extern inline char *
 TCPStateToString(const tcp_stream *cur_stream);
 
 unsigned int
-HashFlow(const tcp_stream *flow);
+HashFlow(const void *flow);
 
 int
-EqualFlow(const tcp_stream *flow1, const tcp_stream *flow2);
+EqualFlow(const void *flow1, const void *flow2);
 
-inline int 
+#if USE_CCP 
+/*----------------------------------------------------------------------------*/
+unsigned int
+HashSID(const void *flow);
+
+int
+EqualSID(const void *flow1, const void *flow2);
+/*----------------------------------------------------------------------------*/
+#endif
+
+extern inline int 
 AddEpollEvent(struct mtcp_epoll *ep, 
 		int queue_type, socket_map_t socket, uint32_t event);
 
-inline void 
+extern inline void 
 RaiseReadEvent(mtcp_manager_t mtcp, tcp_stream *stream);
 
-inline void 
+extern inline void 
 RaiseWriteEvent(mtcp_manager_t mtcp, tcp_stream *stream);
 
-inline void 
+extern inline void 
 RaiseCloseEvent(mtcp_manager_t mtcp, tcp_stream *stream);
 
-inline void 
+extern inline void 
 RaiseErrorEvent(mtcp_manager_t mtcp, tcp_stream *stream);
 
 tcp_stream *
@@ -228,4 +259,7 @@ DestroyTCPStream(mtcp_manager_t mtcp, tcp_stream *stream);
 void 
 DumpStream(mtcp_manager_t mtcp, tcp_stream *stream);
 
-#endif /* __TCP_STREAM_H_ */
+extern inline void
+InitializeTCPStreamManager();
+
+#endif /* TCP_STREAM_H */

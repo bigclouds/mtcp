@@ -646,7 +646,7 @@ LIBMTCP_LIBS=""
 
 if test "$WITH_LIBMTCP" != "no"; then
 	LIBMTCP_CFLAGS="-I$WITH_LIBMTCP/lib/ -I$WITH_LIBMTCP/src/include/ -DMULTI_THREADED"
-	LIBMTCP_LIBS="$WITH_LIBMTCP/lib/libmtcp.a -lpthread -lnuma -lrt"
+	LIBMTCP_LIBS="$WITH_LIBMTCP/lib/libmtcp.a -lpthread -lnuma -lrt -lgmp"
 	CFLAGS="${CFLAGS} ${LIBMTCP_CFLAGS}"
 	AC_DEFINE([HAVE_LIBMTCP], [1], [libmtcp support])
 	AC_MSG_RESULT(yes)
@@ -688,8 +688,10 @@ LIBDPDK_CFLAGS=""
 LIBDPDK_LIBS=""
 
 if test "$WITH_LIBDPDK" != "no"; then
-	LIBDPDK_CFLAGS="-I$WITH_LIBDPDK/include/"
-	LIBDPDK_LIBS="-L$WITH_LIBDPDK/lib/ -m64 -g -O3 -pthread -lrt -march=native -Wl,-export-dynamic -Wl,-lnuma -Wl,-lpthread -Wl,-lrt -Wl,-ldl -Wl,--whole-archive -Wl,-lrte_distributor -Wl,-lrte_kni -Wl,-lrte_pipeline -Wl,-lrte_table -Wl,-lrte_port -Wl,-lrte_timer -Wl,-lrte_hash -Wl,-lrte_lpm -Wl,-lrte_power -Wl,-lrte_acl -Wl,-lrte_meter -Wl,-lrte_sched -Wl,-lm -Wl,-lrt -Wl,--start-group -Wl,-lrte_kvargs -Wl,-lrte_mbuf -Wl,-lrte_ip_frag -Wl,-lethdev -Wl,-lrte_malloc -Wl,-lrte_mempool -Wl,-lrte_ring -Wl,-lrte_eal -Wl,-lrte_cmdline -Wl,-lrte_cfgfile -Wl,-lrte_pmd_bond -Wl,-lrte_pmd_vmxnet3_uio -Wl,-lrte_pmd_i40e -Wl,-lrte_pmd_ixgbe -Wl,-lrte_pmd_e1000 -Wl,-lrte_pmd_ring -Wl,-lrt -Wl,-lm -Wl,-ldl -Wl,--end-group -Wl,--no-whole-archive"
+#	DPDK_MACHINE_FLAGS=`cat $WITH_LIBDPDK/include/cflags.txt`
+#	LIBDPDK_CFLAGS="$DPDK_MACHINE_FLAGS -I$WITH_LIBDPDK/include/"
+	LIBDPDK_LDFLAGS=`cat $WITH_LIBDPDK/lib/ldflags.txt`
+	LIBDPDK_LIBS="-L$WITH_LIBDPDK/lib/ -m64 -g -O3 -pthread -lrt -march=native -Wl,-export-dynamic -Wl,-lnuma -Wl,-lpthread -Wl,-lrt -Wl,-ldl -Wl,$LIBDPDK_LDFLAGS"
 	CFLAGS="${CFLAGS} ${LIBDPDK_CFLAGS}"
 	AC_DEFINE([HAVE_LIBDPDK], [1], [libdpdk support])
 	AC_MSG_RESULT(yes)
@@ -699,6 +701,39 @@ fi
 
 AC_SUBST(LIBDPDK_CFLAGS)
 AC_SUBST(LIBDPDK_LIBS)
+
+AC_MSG_CHECKING(for onvm support)
+AC_ARG_WITH(libonvm,
+    AC_HELP_STRING([--with-libonvm@<:@=PATH@:>@],[Include libonvm support in PATH]),
+    [WITH_LIBONVM=$withval],[WITH_LIBONVM=no])
+
+LIBONVM_CFLAGS=""
+LIBONVM_LIBS=""
+
+if test "$WITH_LIBONVM" != "no"; then
+	LIBONVM_CFLAGS="-I$WITH_LIBONVM/onvm_nflib -I$WITH_LIBONVM/lib"
+	LIBONVM_LIBS="$WITH_LIBONVM/onvm_nflib/$RTE_TARGET/libonvm.a $WITH_LIBONVM/lib/$RTE_TARGET/lib/libonvmhelper.a -lm"
+	CFLAGS="${CFLAGS} ${LIBONVM_CFLAGS}"
+	AC_DEFINE([HAVE_LIBONVM], [1], [libonvm support])
+	AC_MSG_RESULT(yes)
+else
+	AC_MSG_RESULT(no)
+fi
+
+AC_SUBST(LIBONVM_CFLAGS)
+AC_SUBST(LIBONVM_LIBS)
+
+
+AC_MSG_CHECKING(for netmap support)
+AC_ARG_ENABLE(netmap,
+ AC_HELP_STRING([--enable-netmap],[Turn on Netmap support]),
+ [case "${enableval}" in
+   yes) CFLAGS="${CFLAGS} -DHAVE_NETMAP";;
+    no) ;;
+     *) AC_MSG_ERROR(bad value ${enableval} for --enable-lfs) ;;
+  esac],[CFLAGS="${CFLAGS}"
+	 enable_netmap=no])
+AC_MSG_RESULT($enableval)    
 
 dnl build version-id
 LIGHTTPD_VERSION_ID=`echo $PACKAGE_VERSION | $AWK -F '.' '{print "(" $1 " << 16 | " $2 " << 8 | " $3 ")"}'`

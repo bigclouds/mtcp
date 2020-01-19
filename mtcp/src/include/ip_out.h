@@ -1,11 +1,11 @@
-#ifndef __IP_OUT_H_
-#define __IP_OUT_H_
+#ifndef IP_OUT_H
+#define IP_OUT_H
 
 #include <stdint.h>
 #include "tcp_stream.h"
 
-inline int 
-GetOutputInterface(uint32_t daddr);
+extern inline int 
+GetOutputInterface(uint32_t daddr, uint8_t *is_external);
 
 void
 ForwardIPv4Packet(mtcp_manager_t mtcp, int nif_in, char *buf, int len);
@@ -17,4 +17,4 @@ IPOutputStandalone(struct mtcp_manager *mtcp, uint8_t protocol,
 uint8_t *
 IPOutput(struct mtcp_manager *mtcp, tcp_stream *stream, uint16_t tcplen);
 
-#endif /* __IP_OUT_H_ */
+#endif /* IP_OUT_H */

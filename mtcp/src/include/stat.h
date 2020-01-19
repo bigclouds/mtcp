@@ -1,5 +1,5 @@
-#ifndef __STAT_H_
-#define __STAT_H_
+#ifndef STAT_H
+#define STAT_H
 
 struct run_stat
 {
@@ -51,6 +51,10 @@ struct net_stat
 	uint64_t rx_packets[MAX_DEVICES];
 	uint64_t rx_bytes[MAX_DEVICES];
 	uint64_t rx_errors[MAX_DEVICES];
+#ifdef ENABLELRO
+	uint64_t tx_gdptbytes;
+	uint64_t rx_gdptbytes;
+#endif
 };
 
 struct bcast_stat
@@ -78,4 +82,4 @@ struct timeout_stat
 #define STAT_COUNT(stat)
 #endif
 
-#endif /* __STAT_H_ */
+#endif /* STAT_H */

@@ -12,8 +12,8 @@
  *
  */
 
-#ifndef __NRE_RING_BUFFER_
-#define __NRE_RING_BUFFER_
+#ifndef NRE_RING_BUFFER
+#define NRE_RING_BUFFER
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -25,6 +25,7 @@ enum rb_caller
 	AT_MTCP
 };
 /*----------------------------------------------------------------------------*/
+typedef struct mtcp_manager* mtcp_manager_t;
 typedef struct rb_manager* rb_manager_t;
 /*----------------------------------------------------------------------------*/
 struct fragment_ctx
@@ -60,7 +61,7 @@ void RBPrintInfo(struct tcp_ring_buffer* buff);
 void RBPrintStr(struct tcp_ring_buffer* buff);
 void RBPrintHex(struct tcp_ring_buffer* buff);
 /*----------------------------------------------------------------------------*/
-rb_manager_t RBManagerCreate(size_t chunk_size, uint32_t cnum);
+rb_manager_t RBManagerCreate(mtcp_manager_t mtcp, size_t chunk_size, uint32_t cnum);
 /*----------------------------------------------------------------------------*/
 struct tcp_ring_buffer* RBInit(rb_manager_t rbm,  uint32_t init_seq);
 void RBFree(rb_manager_t rbm, struct tcp_ring_buffer* buff);

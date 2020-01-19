@@ -43,7 +43,11 @@ AllocateSocket(mctx_t mctx, int socktype, int need_lock)
 	socket->epoll = 0;
 	socket->events = 0;
 
-	//memset(&socket->saddr, 0, sizeof(struct sockaddr_in));
+	/* 
+	 * reset a few fields (needed for client socket) 
+	 * addr = INADDR_ANY, port = INPORT_ANY
+	 */
+	memset(&socket->saddr, 0, sizeof(struct sockaddr_in));
 	memset(&socket->ep_data, 0, sizeof(mtcp_epoll_data_t));
 
 	return socket;
@@ -61,6 +65,7 @@ FreeSocket(mctx_t mctx, int sockid, int need_lock)
 	
 	socket->socktype = MTCP_SOCK_UNUSED;
 	socket->epoll = MTCP_EPOLLNONE;
+	socket->events = 0;
 
 	if (need_lock)
 		pthread_mutex_lock(&mtcp->ctx->smap_lock);

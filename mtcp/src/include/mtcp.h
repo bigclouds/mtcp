@@ -1,11 +1,14 @@
-#ifndef __MTCP_H_
-#define __MTCP_H_
+#ifndef MTCP_H
+#define MTCP_H
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <sys/queue.h>
 #include <pthread.h>
+#ifndef DISABLE_DPDK
+#include <gmp.h>
+#endif
 
 #include "memory_mgt.h"
 #include "tcp_ring_buffer.h"
@@ -20,6 +23,10 @@
 #include "stat.h"
 #include "io_module.h"
 
+#ifdef ENABLE_ONVM
+#include "onvm_nflib.h"
+#endif
+
 #ifndef TRUE
 #define TRUE (1)
 #endif
@@ -32,34 +39,47 @@
 #define ERROR (-1)
 #endif
 
-#define MAX_CPUS 16
+#define ETHERNET_HEADER_LEN             14  // sizeof(struct ethhdr)
+#define IP_HEADER_LEN                   20  // sizeof(struct iphdr)
+#define TCP_HEADER_LEN                  20  // sizeof(struct tcphdr)
+#define TOTAL_TCP_HEADER_LEN            54  // total header length
 
-#define ETHERNET_HEADER_LEN		14	// sizeof(struct ethhdr)
-#define IP_HEADER_LEN			20	// sizeof(struct iphdr)
-#define TCP_HEADER_LEN			20	// sizeof(struct tcphdr)
-#define TOTAL_TCP_HEADER_LEN	54	// total header length
+/* configurations */
+#define BACKLOG_SIZE                    (10*1024)
+#define MAX_PKT_SIZE                    (2*1024)
+#define ETH_NUM                         MAX_DEVICES
 
-/* configrations */
-#define BACKLOG_SIZE (10*1024)
-#define MAX_PKT_SIZE (2*1024)
-#define ETH_NUM 4
+#define TCP_OPT_TIMESTAMP_ENABLED       TRUE   // enabled for rtt measure
+#define TCP_OPT_SACK_ENABLED            TRUE   // only recv-side implemented
 
-#define TCP_OPT_TIMESTAMP_ENABLED   TRUE	/* enabled for rtt measure */
-#define TCP_OPT_SACK_ENABLED        FALSE	/* not implemented */
+/* Only use rate limiting if using CCP */
+#if USE_CCP
+#undef  RATE_LIMIT_ENABLED
+#define RATE_LIMIT_ENABLED              TRUE
+#define PACING_ENABLED                  FALSE
+// The following two logs are for debugging / experiments only, should be turned
+// off for production use
+// #define DBGCCP                                 // ccp debug messages
+// #define PROBECCP                               // print all cwnd changes, similar to tcpprobe output
+#define CC_NAME				20
+#endif
 
-#define LOCK_STREAM_QUEUE	FALSE
-#define USE_SPIN_LOCK		TRUE
-#define INTR_SLEEPING_MTCP	TRUE
-#define PROMISCUOUS_MODE	TRUE
+#define LOCK_STREAM_QUEUE               FALSE
+#define USE_SPIN_LOCK                   TRUE
+#define INTR_SLEEPING_MTCP              TRUE
+#define PROMISCUOUS_MODE                TRUE
 
 /* blocking api became obsolete */
-#define BLOCKING_SUPPORT	FALSE
+#define BLOCKING_SUPPORT                FALSE
 
+#ifndef MAX_CPUS
+#define MAX_CPUS                        16
+#endif
 /*----------------------------------------------------------------------------*/
 /* Statistics */
 #ifdef NETSTAT
-#define NETSTAT_PERTHREAD	TRUE
-#define NETSTAT_TOTAL		TRUE
+#define NETSTAT_PERTHREAD		TRUE
+#define NETSTAT_TOTAL			TRUE
 #endif /* NETSTAT */
 #define RTM_STAT			FALSE
 /*----------------------------------------------------------------------------*/
@@ -83,6 +103,14 @@
 #define SBUF_LOCK(lock)			pthread_mutex_lock(lock)
 #define SBUF_UNLOCK(lock)		pthread_mutex_unlock(lock)
 #endif /* USE_SPIN_LOCK */
+
+/* add macro if it is not defined in /usr/include/sys/queue.h */
+#ifndef TAILQ_FOREACH_SAFE
+#define TAILQ_FOREACH_SAFE(var, head, field, tvar)                      \
+	for ((var) = TAILQ_FIRST((head));                               \
+	     (var) && ((tvar) = TAILQ_NEXT((var), field), 1);		\
+	     (var) = (tvar))
+#endif
 /*----------------------------------------------------------------------------*/
 struct eth_table
 {
@@ -116,20 +144,20 @@ struct arp_entry
 struct arp_table
 {
 	struct arp_entry *entry;
+	struct arp_entry *gateway;
 	int entries;
 };
 /*----------------------------------------------------------------------------*/
 struct mtcp_config
 {
-	/* socket mode */
-	int8_t socket_mode;
-
 	/* network interface config */
 	struct eth_table *eths;
+	int *nif_to_eidx; // mapping physic port indexes to that of the configured port-list
 	int eths_num;
 
 	/* route config */
 	struct route_table *rtable;		// routing table
+	struct route_table *gateway;	
 	int routes;						// # of entries
 
 	/* arp config */
@@ -138,6 +166,9 @@ struct mtcp_config
 	int num_cores;
 	int num_mem_ch;
 	int max_concurrency;
+#ifndef DISABLE_DPDK
+	mpz_t _cpumask;
+#endif
 
 	int max_num_buffers;
 	int rcvbuf_size;
@@ -149,7 +180,17 @@ struct mtcp_config
 	/* adding multi-process support */
 	uint8_t multi_process;
 	uint8_t multi_process_is_master;
-	uint8_t multi_process_curr_core;
+
+#ifdef ENABLE_ONVM
+	struct onvm_nf_local_ctx *nf_local_ctx;
+	/* onvm specific args */
+	uint16_t onvm_serv;
+  	uint16_t onvm_inst;
+  	uint16_t onvm_dest;
+#endif
+#if USE_CCP
+    char     cc[CC_NAME];
+#endif
 };
 /*----------------------------------------------------------------------------*/
 struct mtcp_context
@@ -182,6 +223,9 @@ struct mtcp_manager
 	sb_manager_t rbm_snd;
 	rb_manager_t rbm_rcv;
 	struct hashtable *tcp_flow_table;
+#if USE_CCP
+	struct hashtable *tcp_sid_table;
+#endif
 
 	uint32_t s_index:24;		/* stream index */
 	socket_map_t smap;
@@ -204,7 +248,7 @@ struct mtcp_manager
 	struct mtcp_epoll *ep;
 	uint32_t ts_last_event;
 
-	struct tcp_listener *listener;
+	struct hashtable *listeners;
 
 	stream_queue_t connectq;				/* streams need to connect */
 	stream_queue_t sendq;				/* streams need to send data */
@@ -255,6 +299,11 @@ struct mtcp_manager
 	struct time_stat rtstat;
 #endif /* NETSTAT */
 	struct io_module_func *iom;
+
+#if USE_CCP
+	int from_ccp;
+	int to_ccp;
+#endif
 };
 /*----------------------------------------------------------------------------*/
 typedef struct mtcp_manager* mtcp_manager_t;
@@ -298,9 +347,9 @@ struct mtcp_thread_context
 /*----------------------------------------------------------------------------*/
 typedef struct mtcp_thread_context* mtcp_thread_context_t;
 /*----------------------------------------------------------------------------*/
-struct mtcp_manager *g_mtcp[MAX_CPUS];
-struct mtcp_config CONFIG;
-addr_pool_t ap;
+extern struct mtcp_manager *g_mtcp[MAX_CPUS];
+extern struct mtcp_config CONFIG;
+extern addr_pool_t ap[ETH_NUM];
 /*----------------------------------------------------------------------------*/
 
-#endif /* __MTCP_H_ */
+#endif /* MTCP_H */
